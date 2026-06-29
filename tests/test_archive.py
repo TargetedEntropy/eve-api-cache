@@ -32,6 +32,16 @@ def test_payload_compression_round_trip():
     assert archive._decompress_payload(codec, compressed) == payload
 
 
+def test_chunks_splits_large_delta_batches():
+    rows = [{"id": i} for i in range(2501)]
+
+    batches = list(archive._chunks(rows, 1000))
+
+    assert [len(batch) for batch in batches] == [1000, 1000, 501]
+    assert batches[0][0] == {"id": 0}
+    assert batches[-1][-1] == {"id": 2500}
+
+
 def test_market_orders_parquet_file_write(tmp_path, monkeypatch):
     pytest.importorskip("pyarrow")
     monkeypatch.setattr(archive.settings, "archive_data_dir", str(tmp_path))

@@ -37,6 +37,7 @@ _MARKET_ORDERS_RE = re.compile(r"^/[^/]+/markets/(\d+)/orders/?$")
 _STORAGE_JSONB = "jsonb"
 _STORAGE_COMPRESSED_JSON = "compressed_json"
 _STORAGE_MARKET_PARQUET_DELTA = "market_parquet_delta"
+_DELTA_INSERT_BATCH_SIZE = 1000
 
 
 async def write_snapshot(
@@ -450,16 +451,16 @@ async def _write_market_order_deltas(
             }
         )
 
-    if version_rows:
-        version_stmt = pg_insert(MarketOrderVersion).values(version_rows)
+    for batch in _chunks(version_rows, _DELTA_INSERT_BATCH_SIZE):
+        version_stmt = pg_insert(MarketOrderVersion).values(batch)
         version_stmt = version_stmt.on_conflict_do_update(
             index_elements=["datasource", "order_id", "version_hash"],
             set_=dict(last_seen_at=fetched_at),
         )
         await session.execute(version_stmt)
 
-    if entry_rows:
-        entry_stmt = pg_insert(MarketOrderSnapshotEntry).values(entry_rows)
+    for batch in _chunks(entry_rows, _DELTA_INSERT_BATCH_SIZE):
+        entry_stmt = pg_insert(MarketOrderSnapshotEntry).values(batch)
         entry_stmt = entry_stmt.on_conflict_do_nothing(
             index_elements=["snapshot_id", "order_id"]
         )
@@ -471,6 +472,11 @@ def _market_orders_region_id(path: str) -> Optional[int]:
     if match is None:
         return None
     return int(match.group(1))
+
+
+def _chunks(rows: list[dict], size: int):
+    for index in range(0, len(rows), size):
+        yield rows[index:index + size]
 
 
 def _read_parquet_payload(file_path: str) -> bytes:

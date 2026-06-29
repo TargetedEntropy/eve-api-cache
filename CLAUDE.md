@@ -11,7 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Data is **never deleted from the archive**. Redis provides the hot-cache layer (short TTL, respects ESI cache headers). A persistent database provides the archive layer (no expiry, append-only for time-series data).
 
-**Phase 1 scope:** Public (no-auth) ESI endpoints only — markets, universe, contracts, sovereignty, incursions, killmails, and public character/corp/alliance info.
+**Phase 1 scope:** Public (no-auth) ESI endpoints only — markets, universe, contracts, sovereignty, incursions, killmails, and public character/corp/alliance info. Do not add OAuth flows, token storage, or private-character scopes in this project unless the scope is deliberately expanded later.
 
 ## ESI Fundamentals
 
@@ -22,17 +22,18 @@ Data is **never deleted from the archive**. Redis provides the hot-cache layer (
 **Cache signals ESI provides (must be respected):**
 - `Cache-Control: public, max-age=NNN` — primary TTL signal
 - `Expires` header — fallback TTL when no max-age
-- `ETag` — pass upstream `If-None-Match`; on 304, serve cached body without updating TTL
+- `ETag` — pass upstream `If-None-Match`; on 304, serve cached body and refresh the hot-cache TTL from the new response headers, but do **not** write a duplicate archive payload unless recording a lightweight observation/check row
 - `Last-Modified` — secondary conditional request header
+- Always send a clear `User-Agent` identifying this service and contact/project URL; ESI operators expect well-behaved clients, and anonymous default library agents make incident response miserable
 
-**Pagination:** Endpoints like `/markets/{region_id}/orders/` return `X-Pages: N` header. The proxy must fan out pages 2..N concurrently after fetching page 1, then merge and cache the full result set.
+**Pagination:** Endpoints like `/markets/{region_id}/orders/` return `X-Pages: N` header. The proxy must fan out pages 2..N after fetching page 1, but with bounded concurrency and retry/backoff. Do not unleash hundreds of simultaneous requests and then act shocked when ESI slaps the shared error budget. Cache/archive only complete page sets; if a page fails, either serve the previous complete cached/archive snapshot or return a partial-data error that is explicitly marked incomplete.
 
 **Error budget headers:**
 - `X-ESI-Error-Limit-Remain` — errors remaining before ESI throttles
 - `X-ESI-Error-Limit-Reset` — seconds until error counter resets
 - On 420 (error limit exceeded) or 503: backoff and return cached data if available.
 
-**Datasource:** Default to `tranquility`. Accept `?datasource=singularity` passthrough for testing.
+**Datasource:** Default to `tranquility`. Accept `?datasource=singularity` passthrough for testing. Include datasource in every cache/archive key and database uniqueness constraint.
 
 ## Public Endpoints to Prioritize
 
@@ -92,24 +93,32 @@ Aggregated from scanning ~15 downstream projects:
 - **Redis** — hot cache with TTL matching ESI `Cache-Control`. Evicts naturally. Serves repeated proxy requests without hitting ESI or the DB.
 - **PostgreSQL** — permanent archive. Data written here is never deleted. Time-series endpoints (markets, jumps, kills, sovereignty) get a timestamp column and append-only inserts. Reference data (universe types, systems, etc.) gets upserted.
 
-**Cache/archive key scheme:** `esi:{method}:{path}:{sorted_query_string}` — e.g. `esi:GET:/v1/markets/10000002/orders/?order_type=all`. For merged paginated results, omit `page=` from the key.
+**Cache/archive key scheme:** `esi:{datasource}:{method}:{path}:{sorted_query_string}` — e.g. `esi:tranquility:GET:/v1/markets/10000002/orders/?order_type=all`. For merged paginated results, omit `page=` from the key. For POST endpoints, include a stable hash of the normalized request body in the key and archive extracted normalized entities separately.
 
 **Request flow:**
 1. Incoming request → normalize path/query → check Redis key
 2. Redis hit with valid TTL → return immediately with `X-Cache: HIT`
 3. Redis miss → fetch ESI with `If-None-Match` if ETag stored
-4. ESI 304 → refresh Redis TTL, return cached body (no archive write needed)
+4. ESI 304 → refresh Redis TTL from response headers, update validation metadata, return cached body (no duplicate archive payload write needed)
 5. ESI 200 → write to Redis (with TTL) **and** write to PostgreSQL archive (with `fetched_at` timestamp)
 6. ESI 5xx → return stale Redis data if available; fall back to most recent archive row
 
 **Archive write strategy by endpoint type:**
-- **Time-series** (orders, prices, jumps, kills, sovereignty, incursions): append every new snapshot with `fetched_at`. Never overwrite.
-- **Reference/static** (universe types, systems, regions, corps, characters): upsert on primary key, store `first_seen_at` and `last_updated_at`.
-- **Event data** (killmails, contracts, contract items): insert-once by natural key (killmail_id+hash, contract_id). Immutable after first write.
+- **Time-series** (orders, prices, jumps, kills, sovereignty, incursions): append each complete observation with `fetched_at`, `observed_until`/ESI expiry when available, and a `content_hash`. Never overwrite historical facts. If payloads are unchanged, it is acceptable to store a compact observation row pointing at the prior payload blob instead of duplicating large JSON forever.
+- **Reference/static** (universe types, systems, regions, corps, characters): upsert on primary key plus datasource, store `first_seen_at`, `last_updated_at`, ETag/Last-Modified, and raw payload for traceability.
+- **Event data** (killmails, contracts, contract items): insert-once by natural key (killmail_id+hash, contract_id) plus datasource. Immutable after first write except for validation metadata.
 
-**Paginated endpoints:** Detect `X-Pages > 1` on first page response, fan out remaining pages concurrently with `asyncio.gather`, merge `items[]` arrays. Archive the merged result as a single snapshot. Return merged result to caller.
+**Paginated endpoints:** Detect `X-Pages > 1` on first page response, fan out remaining pages concurrently with a semaphore, merge `items[]` arrays in page order, and preserve response metadata from every page. Archive the merged result as a single snapshot only when all pages succeed for the same request generation. Return merged result to caller.
 
-**POST endpoints** (`/universe/names/`, `/universe/ids/`, `/characters/affiliation/`): Cache and archive individual ID→name mappings extracted from each batch response so future lookups for known IDs never hit ESI.
+**POST endpoints** (`/universe/names/`, `/universe/ids/`, `/characters/affiliation/`): Cache and archive individual ID→name mappings extracted from each batch response so future lookups for known IDs never hit ESI. Normalize/sort/dedupe request bodies before hashing cache keys, and split oversized batches before sending to ESI.
+
+## Operational Requirements
+
+- **Respect ESI health before freshness.** Track error-limit headers, timeout rates, and 420/5xx responses. Prefer stale cached/archive responses with `Warning`/`X-Cache: STALE` over hammering ESI during trouble.
+- **Expose observability from day one:** counters for upstream requests, cache hits/misses/stale serves, archive writes, page fanout failures, 304 revalidations, current ESI error budget, and per-endpoint latency.
+- **Make archive writes idempotent:** database constraints should prevent duplicate rows for the same datasource, endpoint identity, natural key or `(fetched_at bucket, content_hash)` as appropriate. Retries must not multiply history.
+- **Store enough provenance to trust the archive:** endpoint, versioned path, normalized query/body hash, datasource, fetched_at, ESI expiry/cache headers, ETag/Last-Modified, HTTP status, and payload/content hash.
+- **Do not fabricate fixtures as live data.** Tests may use recorded fixtures, but runtime responses must clearly distinguish live ESI, hot cache, stale cache, and archive fallback.
 
 ## Development Setup
 
@@ -141,5 +150,6 @@ alembic upgrade head
 - **`/characters/{character_id}/portrait/`** returns redirect URLs to image.eveonline.com CDN — cache the redirect target URL, not just the 302.
 - **Singularity** (test server) has different region/system IDs than Tranquility; never cross-pollute cache keys between datasources.
 - ESI rate limit is per **source IP**. If this proxy is shared across users, error budget is pooled — monitor `X-ESI-Error-Limit-Remain` aggressively.
-- Some endpoints (e.g. `/markets/prices/`) don't paginate but are large JSON blobs (~400KB) — store compressed in Redis and as JSONB in PostgreSQL.
-- **Never delete archive rows.** If a market order disappears from the live feed, it still exists in the archive as a historical record. Deletions only happen in Redis (via TTL expiry).
+- Some endpoints (e.g. `/markets/prices/`) don't paginate but are large JSON blobs (~400KB) — store compressed in Redis and consider compressed raw payload storage plus indexed extracted fields in PostgreSQL rather than assuming every blob belongs wholesale in heavily-indexed JSONB.
+- **Never delete archive rows.** If a market order disappears from the live feed, it still exists in the archive as a historical record. Deletions only happen in Redis (via TTL expiry). Schema migrations must preserve archive history or include an explicit export/backfill plan.
+- **Public killmail lookups require both ID and hash.** This service can cache/archive a killmail only after a downstream caller or another source provides the hash; do not pretend ESI offers public killmail discovery.

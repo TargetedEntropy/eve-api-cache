@@ -336,40 +336,35 @@ async def _write_market_orders_parquet(
     if not isinstance(orders, list):
         raise ValueError("market-orders payload must be a JSON list")
 
-    relative_path, stored_size = _write_market_orders_parquet_file(
-        datasource=datasource,
-        region_id=region_id,
-        content_hash=content_hash,
-        fetched_at=fetched_at,
-        orders=orders,
-    )
-
-    metadata = {"region_id": region_id, "snapshot_id": snapshot_id}
-    stmt = pg_insert(ArchiveObjectFile).values({
-        "content_hash": content_hash,
-        "datasource": datasource,
-        "path": path,
-        "query_hash": query_hash,
-        "fetched_at": fetched_at,
-        "storage_format": "parquet",
-        "codec": "zstd",
-        "file_path": relative_path,
-        "raw_size": len(payload),
-        "stored_size": stored_size,
-        "row_count": len(orders),
-        ArchiveObjectFile.__table__.c.metadata: metadata,
-        "created_at": fetched_at,
-    }).on_conflict_do_update(
-        index_elements=["content_hash"],
-        set_={
-            ArchiveObjectFile.file_path: relative_path,
-            ArchiveObjectFile.stored_size: stored_size,
-            ArchiveObjectFile.row_count: len(orders),
+    existing_manifest_id = await _get_object_file_id_by_content_hash(session, content_hash)
+    if existing_manifest_id is not None:
+        manifest_id = existing_manifest_id
+    else:
+        relative_path, stored_size = _write_market_orders_parquet_file(
+            datasource=datasource,
+            region_id=region_id,
+            content_hash=content_hash,
+            fetched_at=fetched_at,
+            orders=orders,
+        )
+        metadata = {"region_id": region_id, "snapshot_id": snapshot_id}
+        stmt = pg_insert(ArchiveObjectFile).values({
+            "content_hash": content_hash,
+            "datasource": datasource,
+            "path": path,
+            "query_hash": query_hash,
+            "fetched_at": fetched_at,
+            "storage_format": "parquet",
+            "codec": "zstd",
+            "file_path": relative_path,
+            "raw_size": len(payload),
+            "stored_size": stored_size,
+            "row_count": len(orders),
             ArchiveObjectFile.__table__.c.metadata: metadata,
-        },
-    ).returning(ArchiveObjectFile.id)
-    result = await session.execute(stmt)
-    manifest_id = result.scalar_one()
+            "created_at": fetched_at,
+        }).returning(ArchiveObjectFile.id)
+        result = await session.execute(stmt)
+        manifest_id = result.scalar_one()
 
     if settings.enable_market_order_deltas:
         await _write_market_order_deltas(
@@ -382,6 +377,14 @@ async def _write_market_orders_parquet(
         )
 
     return manifest_id
+
+
+async def _get_object_file_id_by_content_hash(
+    session: AsyncSession, content_hash: str
+) -> Optional[int]:
+    stmt = select(ArchiveObjectFile.id).where(ArchiveObjectFile.content_hash == content_hash)
+    row = await session.execute(stmt)
+    return row.scalar_one_or_none()
 
 
 def _write_market_orders_parquet_file(

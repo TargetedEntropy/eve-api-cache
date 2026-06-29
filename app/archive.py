@@ -10,6 +10,7 @@ Three write strategies determined by EndpointSpec.archive_type:
 All writes are idempotent: duplicate retries produce no extra rows.
 """
 import json
+import hashlib
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -41,18 +42,22 @@ async def write_snapshot(
     payload_json = json.loads(payload)
 
     if archive_type == ArchiveType.TIME_SERIES:
+        idempotency_key = _timeseries_idempotency_key(
+            datasource, path, query_hash, content_hash, now
+        )
         stmt = pg_insert(TimeSeriesSnapshot).values(
             datasource=datasource,
             path=path,
             query_hash=query_hash,
             content_hash=content_hash,
+            idempotency_key=idempotency_key,
             payload=payload_json,
             fetched_at=now,
             esi_expires_at=expires_at,
             etag=etag,
             http_status=http_status,
         ).on_conflict_do_nothing(
-            constraint="uq_timeseries_snapshot"
+            constraint="uq_timeseries_idempotency"
         )
         await session.execute(stmt)
 
@@ -118,30 +123,24 @@ async def write_names(
     except (ValueError, TypeError):
         return
 
-    if not isinstance(data, list):
+    mappings = _extract_name_mappings(data)
+    if not mappings:
         return
 
-    for item in data:
-        if not isinstance(item, dict):
-            continue
-        # /universe/names/ and /universe/ids/ format
-        entity_id = item.get("id")
-        name = item.get("name")
-        category = item.get("category")
-        if entity_id and name:
-            await cache.set_name(datasource, entity_id, name, category or "unknown")
-            stmt = pg_insert(IdNameCache).values(
-                datasource=datasource,
-                entity_id=entity_id,
-                entity_name=name,
-                category=category,
-                first_seen_at=now,
-                last_updated_at=now,
-            ).on_conflict_do_update(
-                index_elements=["datasource", "entity_id"],
-                set_=dict(entity_name=name, category=category, last_updated_at=now),
-            )
-            await session.execute(stmt)
+    for entity_id, name, category in mappings:
+        await cache.set_name(datasource, entity_id, name, category or "unknown")
+        stmt = pg_insert(IdNameCache).values(
+            datasource=datasource,
+            entity_id=entity_id,
+            entity_name=name,
+            category=category,
+            first_seen_at=now,
+            last_updated_at=now,
+        ).on_conflict_do_update(
+            index_elements=["datasource", "entity_id"],
+            set_=dict(entity_name=name, category=category, last_updated_at=now),
+        )
+        await session.execute(stmt)
 
     await session.commit()
 
@@ -194,3 +193,37 @@ async def get_latest_payload(
         return json.dumps(result).encode()
 
     return None
+
+
+def _timeseries_idempotency_key(
+    datasource: str,
+    path: str,
+    query_hash: str,
+    content_hash: str,
+    fetched_at: datetime,
+) -> str:
+    bucket = fetched_at.replace(second=0, microsecond=0)
+    raw = "\0".join((datasource, path, query_hash, bucket.isoformat(), content_hash))
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _extract_name_mappings(data) -> list[tuple[int, str, Optional[str]]]:
+    if isinstance(data, list):
+        return [
+            (item["id"], item["name"], item.get("category"))
+            for item in data
+            if isinstance(item, dict) and item.get("id") and item.get("name")
+        ]
+
+    if not isinstance(data, dict):
+        return []
+
+    mappings: list[tuple[int, str, Optional[str]]] = []
+    for category, values in data.items():
+        if not isinstance(values, list):
+            continue
+        normalized_category = category[:-1] if category.endswith("s") else category
+        for item in values:
+            if isinstance(item, dict) and item.get("id") and item.get("name"):
+                mappings.append((item["id"], item["name"], normalized_category))
+    return mappings

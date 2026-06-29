@@ -3,6 +3,7 @@ Redis hot-cache layer.
 
 Key layout:
   esi:body:{cache_key}   → raw ESI response bytes (with TTL)
+  esi:stale:{cache_key}  → stale response bytes (TTL + stale window)
   esi:etag:{cache_key}   → ETag string (same TTL + 60s buffer)
   esi:name:{datasource}:{entity_id} → JSON {"name": str, "category": str} (24h TTL)
 """
@@ -37,12 +38,16 @@ class CacheClient:
         body: bytes,
         ttl: int,
         etag: Optional[str] = None,
+        stale_ttl: int = 86400,
     ) -> None:
-        """Store body with TTL. ETag stored with a small buffer beyond body TTL."""
+        """Store body with TTL, plus a bounded stale copy for degraded-mode fallback."""
         pipe = self._r.pipeline()
         pipe.set(f"esi:body:{key}", body, ex=ttl)
+        pipe.set(f"esi:stale:{key}", body, ex=ttl + stale_ttl)
         if etag:
             pipe.set(f"esi:etag:{key}", etag, ex=ttl + 60)
+        else:
+            pipe.delete(f"esi:etag:{key}")
         await pipe.execute()
 
     async def refresh_ttl(self, key: str, ttl: int) -> None:
@@ -51,6 +56,10 @@ class CacheClient:
         pipe.expire(f"esi:body:{key}", ttl)
         pipe.expire(f"esi:etag:{key}", ttl + 60)
         await pipe.execute()
+
+    async def get_stale(self, key: str) -> Optional[bytes]:
+        """Return a recently expired cached body for degraded-mode fallback, if present."""
+        return await self._r.get(f"esi:stale:{key}")
 
     async def get_name(self, datasource: str, entity_id: int) -> Optional[dict]:
         """Return {"name": str, "category": str} for a known entity ID, or None."""

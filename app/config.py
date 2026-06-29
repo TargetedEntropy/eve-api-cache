@@ -9,10 +9,16 @@ class Settings(BaseSettings):
     esi_base_url: str = "https://esi.evetech.net"
     user_agent: str = "eve-api-cache/0.1 (https://github.com/TargetedEntropy/eve-api-cache)"
     esi_timeout: float = 30.0
+    esi_max_retries: int = 2
+    esi_retry_base_delay: float = 0.25
     page_concurrency: int = 10
+    upstream_concurrency: int = 20
     default_datasource: str = "tranquility"
     max_post_body_bytes: int = 65536
     max_post_batch_items: int = 1000
+    stale_cache_seconds: int = 86400
+    client_rate_limit_per_minute: int = 600
+    collector_enabled: bool = True
 
     # Collector — which regions to proactively poll for market data.
     # Defaults: The Forge (Jita), Domain (Amarr), Heimatar (Rens),

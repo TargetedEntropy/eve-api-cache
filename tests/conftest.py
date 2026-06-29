@@ -15,7 +15,10 @@ def test_settings() -> Settings:
         esi_base_url="https://esi.evetech.net",
         user_agent="eve-api-cache-test/0.1",
         esi_timeout=5.0,
+        esi_max_retries=0,
+        esi_retry_base_delay=0.0,
         page_concurrency=3,
+        upstream_concurrency=5,
         default_datasource="tranquility",
     )
 

@@ -42,6 +42,20 @@ async def proxy(
     esi: ESIClient = Depends(get_esi),
     cfg: Settings = Depends(get_settings),
 ) -> Response:
+    client_host = request.client.host if request.client else "unknown"
+    allowed, remaining = await request.app.state.rate_limiter.allow(client_host)
+    if not allowed:
+        return Response(
+            content=b'{"error":"rate limit exceeded"}',
+            status_code=429,
+            media_type="application/json",
+            headers={
+                "X-Cache": "ERROR",
+                "X-RateLimit-Remaining": "0",
+                "Retry-After": "60",
+            },
+        )
+
     full_path = f"/{version}/{path}"
     method = request.method
     params = dict(request.query_params)
@@ -77,6 +91,7 @@ async def proxy(
     result = await proxy_request(full_path, method, params, body, cache, esi, db, cfg)
 
     extra_headers = _CACHE_STATUS_HEADERS.get(result.cache_status, {})
+    extra_headers = {**extra_headers, "X-RateLimit-Remaining": str(remaining)}
     return Response(
         content=result.body,
         status_code=result.status,

@@ -56,10 +56,15 @@ async def _fetch_and_store(
     content_hash = hashlib.sha256(resp.body).hexdigest()
 
     async with AsyncSessionLocal() as session:
-        await write_snapshot(
-            session, datasource, path, query_hash, content_hash,
-            resp.body, 200, resp.etag, resp.expires_at, archive_type,
-        )
+        try:
+            await write_snapshot(
+                session, datasource, path, query_hash, content_hash,
+                resp.body, 200, resp.etag, resp.expires_at, archive_type,
+            )
+        except Exception:
+            await session.rollback()
+            logger.exception("Collector: archive write failed for %s", path)
+            return False
 
     return True
 
@@ -198,6 +203,17 @@ async def collect_sovereignty_map(
     return ok
 
 
+async def collect_sovereignty_structures(
+    esi: ESIClient, cache: CacheClient, datasource: str = "tranquility"
+) -> bool:
+    ok = await _fetch_and_store(
+        "/v1/sovereignty/structures/", {}, ArchiveType.TIME_SERIES, esi, cache, datasource
+    )
+    if ok:
+        logger.info("Collector: sovereignty structures archived")
+    return ok
+
+
 async def collect_incursions(
     esi: ESIClient, cache: CacheClient, datasource: str = "tranquility"
 ) -> bool:
@@ -206,4 +222,15 @@ async def collect_incursions(
     )
     if ok:
         logger.info("Collector: incursions archived")
+    return ok
+
+
+async def collect_industry_facilities(
+    esi: ESIClient, cache: CacheClient, datasource: str = "tranquility"
+) -> bool:
+    ok = await _fetch_and_store(
+        "/v1/industry/facilities/", {}, ArchiveType.TIME_SERIES, esi, cache, datasource
+    )
+    if ok:
+        logger.info("Collector: industry facilities archived")
     return ok

@@ -6,7 +6,7 @@ Unauthenticated ESI proxy and permanent historical archive for the [EVE Online E
 
 - **Proxy cache** — downstream apps call this instead of ESI directly, reducing rate-limit pressure and latency. Responses are served from Redis with `X-Cache: HIT/MISS/STALE` headers.
 - **Historical archive** — every ESI response is written to PostgreSQL permanently. ESI data is ephemeral (market orders expire, system kill stats roll over, market history caps at ~13 months); this service preserves it forever.
-- **Background collector** — APScheduler polls configured endpoints proactively on a schedule, so market data, sovereignty maps, system stats, and market history are available as cache HITs before anyone requests them.
+- **Background collector** — APScheduler polls configured endpoints proactively on a schedule, so market data, sovereignty, industry facilities, system stats, and market history are available as cache HITs before anyone requests them.
 
 Phase 1 covers public (no-auth) endpoints only: markets, universe, contracts, sovereignty, incursions, killmails, and public character/corp/alliance info.
 
@@ -37,7 +37,7 @@ APScheduler (background) → ESI upstream
 **Storage tiers:**
 - Redis — TTL matches ESI `Cache-Control`. Evicts naturally.
 - PostgreSQL — three write strategies by endpoint type:
-  - *Time-series* (market orders, system jumps/kills, sovereignty): append-only with `fetched_at`
+  - *Time-series* (market orders, system jumps/kills, sovereignty): append-only with retry idempotency
   - *Reference* (universe types, systems, corps): upsert on primary key
   - *Event* (killmails, contract items): insert-once, immutable
 
@@ -95,7 +95,7 @@ The collector runs inside the same FastAPI process as background asyncio tasks (
 | Market orders (per region) | 5 min |
 | Market prices (global) | 1 hr |
 | Market history (per region, type IDs from latest orders) | Daily |
-| System jumps, kills, sovereignty, incursions | 1 hr |
+| System jumps, kills, sovereignty, incursions, industry facilities | 1 hr |
 
 Check which jobs are running and their next fire time:
 
@@ -105,7 +105,7 @@ GET /collector/status
 
 ## Supported endpoints
 
-All public ESI endpoints across: markets, universe (types, systems, regions, constellations, stations, planets, stars, factions, groups, jumps, kills, names/ids), characters (public info, portraits, corp history, affiliation), corporations, alliances, public contracts, killmails, sovereignty, incursions, industry facilities, and server status.
+Supported Phase 1 endpoints include markets, selected universe reference/stat endpoints, public character/corporation/alliance information, public contracts, public killmails, sovereignty, incursions, industry facilities, and server status.
 
 Private/authenticated endpoints are not proxied and return 404.
 
@@ -115,7 +115,7 @@ Private/authenticated endpoints are not proxied and return 404.
 pytest
 ```
 
-45 tests covering the cache layer (Redis key layout, TTL behaviour), ESI client (pagination merge, ETag/304, error headers), proxy logic (cache hit/miss, archive fallback, path validation, allowlist enforcement), and the background collector (per-endpoint fetch, datasource param handling, cache key consistency, type ID discovery).
+Tests cover the cache layer, ESI client, proxy logic, background collector, and PostgreSQL archive write path. PostgreSQL archive integration tests skip automatically when no migrated test database is available.
 
 ## Environment variables
 
@@ -126,10 +126,16 @@ pytest
 | `ESI_BASE_URL` | `https://esi.evetech.net` | ESI base URL |
 | `USER_AGENT` | `eve-api-cache/0.1 (...)` | User-Agent sent to ESI |
 | `ESI_TIMEOUT` | `30.0` | ESI request timeout (seconds) |
+| `ESI_MAX_RETRIES` | `2` | Retries for transient upstream failures |
+| `ESI_RETRY_BASE_DELAY` | `0.25` | Initial retry backoff in seconds |
 | `PAGE_CONCURRENCY` | `10` | Max concurrent page fetches per paginated request |
+| `UPSTREAM_CONCURRENCY` | `20` | Global max concurrent upstream ESI requests per process |
 | `DEFAULT_DATASOURCE` | `tranquility` | Default ESI datasource |
 | `MAX_POST_BODY_BYTES` | `65536` | Max accepted POST body size before forwarding to ESI |
 | `MAX_POST_BATCH_ITEMS` | `1000` | Max items in public ESI batch lookup requests |
+| `STALE_CACHE_SECONDS` | `86400` | How long Redis keeps stale bodies for degraded fallback |
+| `CLIENT_RATE_LIMIT_PER_MINUTE` | `600` | Per-client proxy request limit per process; `0` disables |
+| `COLLECTOR_ENABLED` | `true` | Start the in-process APScheduler collector |
 | `MARKET_REGION_IDS` | `[10000002,...]` | Region IDs to backfill market orders for |
 | `POLL_MARKET_ORDERS_SECONDS` | `300` | Market order poll interval |
 | `POLL_MARKET_PRICES_SECONDS` | `3600` | Market prices poll interval |

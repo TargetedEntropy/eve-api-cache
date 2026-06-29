@@ -60,6 +60,19 @@ def make_esi_404(body: bytes = b'{"error":"not found"}') -> ESIResponse:
     )
 
 
+def make_esi_420(body: bytes = b'{"error":"error limit exceeded"}') -> ESIResponse:
+    return ESIResponse(
+        status=420,
+        body=body,
+        etag=None,
+        max_age=None,
+        expires_at=None,
+        not_modified=False,
+        error_limit_remain=0,
+        error_limit_reset=60,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Test 1: Cache HIT — ESI is never contacted
 # ---------------------------------------------------------------------------
@@ -239,6 +252,7 @@ async def test_datasource_param_changes_cache_key(
     assert result.status == 200
     assert result.cache_status == "MISS"
     mock_esi.fetch.assert_called_once()
+    assert mock_esi.fetch.call_args.args[2] == {"datasource": "singularity"}
 
 
 # ---------------------------------------------------------------------------
@@ -338,3 +352,90 @@ async def test_esi_200_no_snapshot_for_none_archive_type(
 
     assert result.status == 200
     mock_write_snapshot.assert_not_called()
+
+
+async def test_esi_420_uses_archive_fallback(
+    cache_client: CacheClient, mock_db, test_settings: Settings
+):
+    mock_esi = AsyncMock()
+    mock_esi.fetch.return_value = make_esi_420()
+    archive_body = b'[{"order_id":10}]'
+
+    with patch("app.archive.get_latest_payload", new=AsyncMock(return_value=archive_body)):
+        result = await proxy_request(
+            "/v1/markets/10000002/orders/", "GET",
+            {"order_type": "all"}, None,
+            cache_client, mock_esi, mock_db, test_settings,
+        )
+
+    assert result.status == 200
+    assert result.cache_status == "ARCHIVE_FALLBACK"
+    assert result.body == archive_body
+
+
+async def test_esi_503_uses_stale_redis_before_archive(
+    cache_client: CacheClient, mock_db, test_settings: Settings
+):
+    mock_esi = AsyncMock()
+    mock_esi.fetch.return_value = make_esi_500(b'{"error":"upstream failed"}')
+
+    key = build_cache_key(
+        "tranquility", "GET", "/v1/markets/10000002/orders/", {"order_type": "all"}, None
+    )
+    await cache_client.set(key, b'[{"order_id":1}]', ttl=300, etag='"e1"')
+    await cache_client._r.delete(f"esi:body:{key}")
+
+    mock_archive = AsyncMock(return_value=b'[{"order_id":2}]')
+    with patch("app.archive.get_latest_payload", new=mock_archive):
+        result = await proxy_request(
+            "/v1/markets/10000002/orders/", "GET",
+            {"order_type": "all"}, None,
+            cache_client, mock_esi, mock_db, test_settings,
+        )
+
+    assert result.status == 200
+    assert result.cache_status == "STALE"
+    assert result.body == b'[{"order_id":1}]'
+    mock_archive.assert_not_called()
+
+
+async def test_post_body_is_normalized_before_forwarding(
+    cache_client: CacheClient, mock_db, test_settings: Settings
+):
+    mock_esi = AsyncMock()
+    mock_esi.fetch.return_value = make_esi_200(
+        b'[{"id":1,"name":"A","category":"character"},{"id":2,"name":"B","category":"character"}]'
+    )
+
+    with patch("app.archive.write_snapshot", new=AsyncMock()), patch(
+        "app.archive.write_names", new=AsyncMock()
+    ):
+        result = await proxy_request(
+            "/v1/universe/names/", "POST",
+            {}, b"[2,1,2]",
+            cache_client, mock_esi, mock_db, test_settings,
+        )
+
+    assert result.status == 200
+    forwarded_body = mock_esi.fetch.call_args.args[3]
+    assert forwarded_body == b"[1,2]"
+
+
+async def test_archive_write_failure_does_not_fail_proxy_response(
+    cache_client: CacheClient, mock_db, test_settings: Settings
+):
+    mock_esi = AsyncMock()
+    mock_esi.fetch.return_value = make_esi_200(b'[{"order_id":1}]')
+    mock_db.rollback = AsyncMock()
+
+    with patch("app.archive.write_snapshot", new=AsyncMock(side_effect=RuntimeError("db down"))):
+        result = await proxy_request(
+            "/v1/markets/10000002/orders/", "GET",
+            {"order_type": "all"}, None,
+            cache_client, mock_esi, mock_db, test_settings,
+        )
+
+    assert result.status == 200
+    assert result.cache_status == "MISS"
+    assert result.body == b'[{"order_id":1}]'
+    mock_db.rollback.assert_awaited_once()

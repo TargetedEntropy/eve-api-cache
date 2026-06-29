@@ -162,6 +162,42 @@ async def test_5xx_returned_without_raising(esi: ESIClient):
     assert resp.error_limit_reset == 30
 
 
+async def test_initial_transport_error_returns_503(esi: ESIClient):
+    with respx.mock:
+        respx.get("https://esi.evetech.net/v1/status/").mock(
+            side_effect=httpx.ConnectError("timeout")
+        )
+        resp = await esi.fetch("/v1/status/")
+
+    assert resp.status == 503
+    assert json.loads(resp.body) == {"error": "upstream request failed"}
+
+
+async def test_transient_transport_error_is_retried(test_settings: Settings):
+    retry_settings = test_settings.model_copy(
+        update={"esi_max_retries": 1, "esi_retry_base_delay": 0.0}
+    )
+    client = ESIClient(retry_settings)
+    calls = {"count": 0}
+
+    def handler(request):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise httpx.ConnectError("timeout", request=request)
+        return httpx.Response(200, json={"players": 100})
+
+    try:
+        with respx.mock:
+            respx.get("https://esi.evetech.net/v1/status/").mock(side_effect=handler)
+            resp = await client.fetch("/v1/status/")
+    finally:
+        await client.aclose()
+
+    assert resp.status == 200
+    assert json.loads(resp.body) == {"players": 100}
+    assert calls["count"] == 2
+
+
 # ---------------------------------------------------------------------------
 # Test 6: ESI error-limit headers are parsed correctly
 # ---------------------------------------------------------------------------

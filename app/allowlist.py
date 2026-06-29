@@ -60,7 +60,7 @@ _ENDPOINTS: list[EndpointSpec] = [
     EndpointSpec(re.compile(r"^/characters/\d+/?$"), frozenset({"GET"}), ArchiveType.REFERENCE),
     EndpointSpec(re.compile(r"^/characters/\d+/portrait/?$"), frozenset({"GET"}), ArchiveType.REFERENCE),
     EndpointSpec(re.compile(r"^/characters/\d+/corporationhistory/?$"), frozenset({"GET"}), ArchiveType.TIME_SERIES),
-    EndpointSpec(re.compile(r"^/characters/affiliation/?$"), frozenset({"POST"}), ArchiveType.REFERENCE, extract_names=True),
+    EndpointSpec(re.compile(r"^/characters/affiliation/?$"), frozenset({"POST"}), ArchiveType.REFERENCE),
     # Corporations
     EndpointSpec(re.compile(r"^/corporations/\d+/?$"), frozenset({"GET"}), ArchiveType.REFERENCE),
     EndpointSpec(re.compile(r"^/corporations/\d+/icons/?$"), frozenset({"GET"}), ArchiveType.REFERENCE),
@@ -121,8 +121,36 @@ def match_endpoint(unversioned_path: str, method: str) -> Optional[EndpointSpec]
 
 
 def normalize_params(params: dict) -> dict:
-    """Remove proxy-internal params and sort for stable hashing. Strip page= (we merge pages)."""
-    return {k: v for k, v in sorted(params.items()) if k not in ("page",)}
+    """Remove proxy-internal params and sort for stable hashing."""
+    return {k: v for k, v in sorted(params.items()) if k not in ("page", "datasource")}
+
+
+def normalize_body(body: bytes | None) -> bytes | None:
+    """
+    Normalize JSON batch request bodies for stable cache keys and upstream requests.
+
+    Public ESI batch endpoints accept simple lists. We sort and dedupe those lists so
+    semantically equivalent batches share one cache key and one forwarded body.
+    """
+    if not body:
+        return body
+    try:
+        parsed = json.loads(body)
+    except (ValueError, TypeError):
+        return body
+    if not isinstance(parsed, list):
+        return body
+
+    seen: set[str] = set()
+    normalized = []
+    for item in sorted(parsed, key=lambda value: json.dumps(value, sort_keys=True)):
+        marker = json.dumps(item, sort_keys=True, separators=(",", ":"))
+        if marker in seen:
+            continue
+        seen.add(marker)
+        normalized.append(item)
+
+    return json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode()
 
 
 def compute_query_hash(params: dict, body: bytes | None) -> str:
@@ -131,14 +159,7 @@ def compute_query_hash(params: dict, body: bytes | None) -> str:
     h = hashlib.sha256()
     h.update(json.dumps(normalized, sort_keys=True).encode())
     if body:
-        # Normalize JSON body: parse and re-serialize sorted
-        try:
-            parsed = json.loads(body)
-            if isinstance(parsed, list):
-                parsed = sorted(parsed)
-            h.update(json.dumps(parsed, sort_keys=True).encode())
-        except (ValueError, TypeError):
-            h.update(body)
+        h.update(normalize_body(body) or body)
     return h.hexdigest()[:16]
 
 

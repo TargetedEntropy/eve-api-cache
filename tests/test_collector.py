@@ -17,7 +17,9 @@ from app.collector import (
     collect_market_history,
     collect_market_orders,
     collect_market_prices,
+    collect_industry_facilities,
     collect_sovereignty_map,
+    collect_sovereignty_structures,
     collect_system_jumps,
     collect_system_kills,
 )
@@ -150,10 +152,12 @@ async def test_collect_market_history_single_type(cache_client, mock_esi):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("fn,expected_path", [
-    (collect_system_jumps,    "/v1/universe/system_jumps/"),
-    (collect_system_kills,    "/v1/universe/system_kills/"),
-    (collect_sovereignty_map, "/v1/sovereignty/map/"),
-    (collect_incursions,      "/v1/incursions/"),
+    (collect_system_jumps,              "/v1/universe/system_jumps/"),
+    (collect_system_kills,              "/v1/universe/system_kills/"),
+    (collect_sovereignty_map,           "/v1/sovereignty/map/"),
+    (collect_sovereignty_structures,    "/v1/sovereignty/structures/"),
+    (collect_incursions,                "/v1/incursions/"),
+    (collect_industry_facilities,       "/v1/industry/facilities/"),
 ])
 async def test_universe_collectors(fn, expected_path, cache_client, mock_esi):
     mock_esi.fetch.return_value = make_200(b"[]")
@@ -210,6 +214,17 @@ async def test_singularity_datasource_sends_param_to_esi(cache_client, mock_esi)
 
     esi_params = mock_esi.fetch.call_args.kwargs.get("params", {})
     assert esi_params.get("datasource") == "singularity"
+
+    from app.allowlist import build_cache_key
+    expected_key = build_cache_key(
+        "singularity",
+        "GET",
+        "/v1/markets/10000002/orders/",
+        {"order_type": "all", "datasource": "singularity"},
+        None,
+    )
+    cached = await cache_client.get(expected_key)
+    assert cached is not None
 
 
 async def test_tranquility_datasource_omits_param_from_esi(cache_client, mock_esi):

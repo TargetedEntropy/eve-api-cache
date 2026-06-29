@@ -25,8 +25,8 @@ class TimeSeriesSnapshot(Base):
     market orders, prices, system jumps/kills, sovereignty, incursions, etc.
 
     Each row is a complete snapshot at a point in time. Never updated or deleted.
-    Duplicate retries are idempotent via the unique constraint on
-    (datasource, path, query_hash, fetched_at_bucket, content_hash).
+    Duplicate retries are idempotent via idempotency_key, which is derived from
+    datasource, path, query hash, a short fetched-at bucket, and content hash.
     """
     __tablename__ = "archive_timeseries"
 
@@ -35,6 +35,7 @@ class TimeSeriesSnapshot(Base):
     path: Mapped[str] = mapped_column(Text, nullable=False)
     query_hash: Mapped[str] = mapped_column(String(16), nullable=False)
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    idempotency_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
     fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     esi_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -46,6 +47,7 @@ class TimeSeriesSnapshot(Base):
             "datasource", "path", "query_hash", "fetched_at", "content_hash",
             name="uq_timeseries_snapshot",
         ),
+        UniqueConstraint("idempotency_key", name="uq_timeseries_idempotency"),
         Index("ix_timeseries_lookup", "datasource", "path", "query_hash", "fetched_at"),
     )
 

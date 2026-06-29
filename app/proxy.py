@@ -8,9 +8,9 @@ Request flow:
 4. Recover ETag from Redis (outlives the body key by 60s) for conditional request
 5. Coalesce identical in-flight requests (stampede protection)
 6. Fetch ESI with If-None-Match if ETag known
-7. 304: body was evicted but ESI confirms content unchanged; re-fetch without ETag
-8. 200: store in Redis + write to PostgreSQL archive, return body
-9. 5xx: return stale Redis data or archive fallback
+7. 304: restore the body from stale Redis if available, otherwise re-fetch
+8. 200: store in Redis, attempt archive write, return body
+9. 420/5xx: return stale Redis data or archive fallback
 10. 4xx: pass through to caller
 """
 import hashlib
@@ -27,6 +27,7 @@ from app.allowlist import (
     build_cache_key,
     compute_query_hash,
     match_endpoint,
+    normalize_body,
     normalize_params,
     validate_datasource,
     validate_path,
@@ -76,11 +77,15 @@ async def proxy_request(
         validation_error = _validate_post_body(body, settings.max_post_batch_items)
         if validation_error:
             return ProxyResult(400, validation_error, "ERROR")
+        body = normalize_body(body)
 
     # --- 2. Build cache key ---
     clean_params = normalize_params(params)
     query_hash = compute_query_hash(clean_params, body)
     cache_key = build_cache_key(datasource, method, full_path, params, body)
+    esi_params = dict(clean_params)
+    if datasource != "tranquility":
+        esi_params["datasource"] = datasource
 
     # --- 3. Redis hot cache ---
     cached = await cache.get(cache_key)
@@ -95,38 +100,61 @@ async def proxy_request(
 
     # --- 5. Coalesced ESI fetch (stampede protection) ---
     async def do_fetch():
-        return await esi.fetch(full_path, method, clean_params, body, stored_etag)
+        return await esi.fetch(full_path, method, esi_params, body, stored_etag)
 
     esi_resp = await coalesce(cache_key, do_fetch)
 
     # --- 7. 304 Not Modified ---
     if esi_resp.not_modified:
-        # Body was evicted from Redis but ESI confirms content is unchanged.
-        # We have no body to serve, so re-fetch without ETag to repopulate cache.
-        logger.debug("304 but body evicted; re-fetching %s without ETag", full_path)
-        esi_resp = await esi.fetch(full_path, method, clean_params, body, None)
+        stale_body = await cache.get_stale(cache_key)
+        if stale_body is not None:
+            ttl = esi_resp.max_age or 300
+            await cache.set(
+                cache_key,
+                stale_body,
+                ttl,
+                esi_resp.etag or stored_etag,
+                settings.stale_cache_seconds,
+            )
+            return ProxyResult(200, stale_body, "MISS")
+
+        # Body was evicted from Redis and no stale copy remains, so re-fetch without
+        # ETag to repopulate the body cache.
+        logger.debug("304 but body unavailable; re-fetching %s without ETag", full_path)
+        esi_resp = await esi.fetch(full_path, method, esi_params, body, None)
 
     # --- 8. ESI 200 ---
     if esi_resp.status == 200:
         ttl = esi_resp.max_age or 300
-        await cache.set(cache_key, esi_resp.body, ttl, esi_resp.etag)
+        await cache.set(
+            cache_key,
+            esi_resp.body,
+            ttl,
+            esi_resp.etag,
+            settings.stale_cache_seconds,
+        )
 
-        if spec.archive_type != ArchiveType.NONE:
-            content_hash = hashlib.sha256(esi_resp.body).hexdigest()
-            await archive.write_snapshot(
-                db, datasource, full_path, query_hash, content_hash,
-                esi_resp.body, 200, esi_resp.etag, esi_resp.expires_at,
-                spec.archive_type,
-            )
-
-        if spec.extract_names:
-            await archive.write_names(db, cache, datasource, esi_resp.body)
+        await _archive_response(
+            db=db,
+            cache=cache,
+            datasource=datasource,
+            full_path=full_path,
+            query_hash=query_hash,
+            body=esi_resp.body,
+            etag=esi_resp.etag,
+            expires_at=esi_resp.expires_at,
+            archive_type=spec.archive_type,
+            extract_names=spec.extract_names,
+        )
 
         return ProxyResult(200, esi_resp.body, "MISS")
 
-    # --- 9. ESI 5xx: stale/archive fallback ---
-    if esi_resp.status >= 500:
-        logger.warning("ESI %s for %s; serving archive fallback", esi_resp.status, full_path)
+    # --- 9. ESI degraded mode: stale/archive fallback ---
+    if esi_resp.status == 420 or esi_resp.status >= 500:
+        logger.warning("ESI %s for %s; serving fallback if available", esi_resp.status, full_path)
+        stale_body = await cache.get_stale(cache_key)
+        if stale_body is not None:
+            return ProxyResult(200, stale_body, "STALE")
         archive_body = await archive.get_latest_payload(db, datasource, full_path, query_hash)
         if archive_body:
             return ProxyResult(200, archive_body, "ARCHIVE_FALLBACK")
@@ -152,7 +180,35 @@ def _validate_post_body(body: Optional[bytes], max_items: int) -> Optional[bytes
     if len(parsed) > max_items:
         return b'{"error":"POST batch too large"}'
 
-    if not all(isinstance(item, (int, str)) for item in parsed):
+    if not all(isinstance(item, (int, str)) and not isinstance(item, bool) for item in parsed):
         return b'{"error":"POST batch items must be strings or integers"}'
 
     return None
+
+
+async def _archive_response(
+    db: AsyncSession,
+    cache: CacheClient,
+    datasource: str,
+    full_path: str,
+    query_hash: str,
+    body: bytes,
+    etag: Optional[str],
+    expires_at,
+    archive_type: ArchiveType,
+    extract_names: bool,
+) -> None:
+    """Archive a successful ESI response without failing the live proxy response."""
+    try:
+        if archive_type != ArchiveType.NONE:
+            content_hash = hashlib.sha256(body).hexdigest()
+            await archive.write_snapshot(
+                db, datasource, full_path, query_hash, content_hash,
+                body, 200, etag, expires_at, archive_type,
+            )
+
+        if extract_names:
+            await archive.write_names(db, cache, datasource, body)
+    except Exception:
+        await db.rollback()
+        logger.exception("Archive write failed for %s", full_path)

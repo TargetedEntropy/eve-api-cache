@@ -12,6 +12,7 @@ dependencies = [
     "alembic>=1.13",
     "pydantic-settings>=2.2",
     "respx>=0.21",
+    "apscheduler>=3.10,<4",
 ]
 
 [project.optional-dependencies]

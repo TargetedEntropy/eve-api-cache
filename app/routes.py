@@ -1,4 +1,4 @@
-"""FastAPI routes — health check + catch-all ESI proxy."""
+"""FastAPI routes — health check, collector status, catch-all ESI proxy."""
 from fastapi import APIRouter, Depends, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -7,6 +7,7 @@ from app.config import Settings
 from app.deps import get_cache, get_db, get_esi, get_settings
 from app.esi_client import ESIClient
 from app.proxy import proxy_request
+from app.scheduler import scheduler_status
 
 router = APIRouter()
 
@@ -22,6 +23,13 @@ _CACHE_STATUS_HEADERS = {
 @router.get("/healthz")
 async def health() -> dict:
     return {"status": "ok"}
+
+
+@router.get("/collector/status")
+async def collector_status(request: Request) -> dict:
+    """List all scheduled collector jobs and their next run times."""
+    jobs = scheduler_status(request.app.state.scheduler)
+    return {"jobs": jobs, "count": len(jobs)}
 
 
 @router.api_route("/{version}/{path:path}", methods=["GET", "POST"])

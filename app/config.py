@@ -12,5 +12,16 @@ class Settings(BaseSettings):
     page_concurrency: int = 10
     default_datasource: str = "tranquility"
 
+    # Collector — which regions to proactively poll for market data.
+    # Defaults: The Forge (Jita), Domain (Amarr), Heimatar (Rens),
+    #           Sinq Laison (Dodixie), Metropolis (Hek)
+    market_region_ids: list[int] = [10000002, 10000043, 10000030, 10000032, 10000042]
+
+    # Collector poll intervals (seconds)
+    poll_market_orders_seconds: int = 300    # ESI cache TTL for orders
+    poll_market_prices_seconds: int = 3600   # global prices update hourly
+    poll_market_history_seconds: int = 86400 # history updates daily
+    poll_universe_seconds: int = 3600        # jumps, kills, sovereignty, incursions
+
 
 settings = Settings()

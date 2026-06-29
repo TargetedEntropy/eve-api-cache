@@ -6,6 +6,7 @@ Unauthenticated ESI proxy and permanent historical archive for the [EVE Online E
 
 - **Proxy cache** — downstream apps call this instead of ESI directly, reducing rate-limit pressure and latency. Responses are served from Redis with `X-Cache: HIT/MISS/STALE` headers.
 - **Historical archive** — every ESI response is written to PostgreSQL permanently. ESI data is ephemeral (market orders expire, system kill stats roll over, market history caps at ~13 months); this service preserves it forever.
+- **Background collector** — APScheduler polls configured endpoints proactively on a schedule, so market data, sovereignty maps, system stats, and market history are available as cache HITs before anyone requests them.
 
 Phase 1 covers public (no-auth) endpoints only: markets, universe, contracts, sovereignty, incursions, killmails, and public character/corp/alliance info.
 
@@ -15,6 +16,10 @@ Phase 1 covers public (no-auth) endpoints only: markets, universe, contracts, so
 caller → FastAPI proxy → Redis (hot cache, TTL-based)
                        → ESI upstream (httpx, ETag/304, paginated fan-out)
                        → PostgreSQL (permanent archive, never deleted)
+
+APScheduler (background) → ESI upstream
+                         → Redis (pre-populate before any caller arrives)
+                         → PostgreSQL (same archive layer as proxy)
 ```
 
 **Storage tiers:**
@@ -57,6 +62,7 @@ GET  http://localhost:8080/v1/universe/types/34/
 GET  http://localhost:8080/latest/sovereignty/map/
 POST http://localhost:8080/v1/universe/names/    # body: [12345, 67890]
 GET  http://localhost:8080/healthz
+GET  http://localhost:8080/collector/status      # list scheduled jobs + next run times
 ```
 
 Response headers:
@@ -65,6 +71,25 @@ Response headers:
 - `X-Cache: STALE` / `X-Archive-Fallback: true` — ESI was down; served from archive
 
 The `datasource` query parameter is supported (`?datasource=singularity`) and is included in every cache/archive key.
+
+## Background collector
+
+The collector runs inside the same FastAPI process as background asyncio tasks (via APScheduler). It polls ESI on a configurable schedule and writes results through the same cache + archive pipeline as the proxy.
+
+**Default schedule (configurable via env):**
+
+| Endpoint | Interval |
+|---|---|
+| Market orders (per region) | 5 min |
+| Market prices (global) | 1 hr |
+| Market history (per region, type IDs from latest orders) | Daily |
+| System jumps, kills, sovereignty, incursions | 1 hr |
+
+Check which jobs are running and their next fire time:
+
+```
+GET /collector/status
+```
 
 ## Supported endpoints
 
@@ -78,7 +103,7 @@ Private/authenticated endpoints are not proxied and return 404.
 pytest
 ```
 
-31 tests covering the cache layer (Redis key layout, TTL behaviour), ESI client (pagination merge, ETag/304, error headers), and proxy logic (cache hit/miss, archive fallback, path validation, allowlist enforcement).
+45 tests covering the cache layer (Redis key layout, TTL behaviour), ESI client (pagination merge, ETag/304, error headers), proxy logic (cache hit/miss, archive fallback, path validation, allowlist enforcement), and the background collector (per-endpoint fetch, datasource param handling, cache key consistency, type ID discovery).
 
 ## Environment variables
 
@@ -91,3 +116,8 @@ pytest
 | `ESI_TIMEOUT` | `30.0` | ESI request timeout (seconds) |
 | `PAGE_CONCURRENCY` | `10` | Max concurrent page fetches per paginated request |
 | `DEFAULT_DATASOURCE` | `tranquility` | Default ESI datasource |
+| `MARKET_REGION_IDS` | `[10000002,...]` | Region IDs to backfill market orders for |
+| `POLL_MARKET_ORDERS_SECONDS` | `300` | Market order poll interval |
+| `POLL_MARKET_PRICES_SECONDS` | `3600` | Market prices poll interval |
+| `POLL_MARKET_HISTORY_SECONDS` | `86400` | Market history poll interval |
+| `POLL_UNIVERSE_SECONDS` | `3600` | Universe stats (jumps, kills, sov, incursions) poll interval |

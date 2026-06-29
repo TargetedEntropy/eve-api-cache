@@ -22,7 +22,7 @@ Data is **never deleted from the archive**. Redis provides the hot-cache layer (
 **Cache signals ESI provides (must be respected):**
 - `Cache-Control: public, max-age=NNN` — primary TTL signal
 - `Expires` header — fallback TTL when no max-age
-- `ETag` — pass upstream `If-None-Match`; on 304, serve cached body and refresh the hot-cache TTL from the new response headers, but do **not** write a duplicate archive payload unless recording a lightweight observation/check row
+- `ETag` — pass upstream `If-None-Match`; on 304, serve cached body and extend the hot-cache TTL using the new `Cache-Control` header if present, otherwise preserve the existing TTL. Do not write an archive payload on 304.
 - `Last-Modified` — secondary conditional request header
 - Always send a clear `User-Agent` identifying this service and contact/project URL; ESI operators expect well-behaved clients, and anonymous default library agents make incident response miserable
 
@@ -99,7 +99,7 @@ Aggregated from scanning ~15 downstream projects:
 1. Incoming request → normalize path/query → check Redis key
 2. Redis hit with valid TTL → return immediately with `X-Cache: HIT`
 3. Redis miss → fetch ESI with `If-None-Match` if ETag stored
-4. ESI 304 → refresh Redis TTL from response headers, update validation metadata, return cached body (no duplicate archive payload write needed)
+4. ESI 304 → extend Redis TTL if new `Cache-Control` header present (otherwise preserve existing TTL), return cached body. No archive write.
 5. ESI 200 → write to Redis (with TTL) **and** write to PostgreSQL archive (with `fetched_at` timestamp)
 6. ESI 5xx → return stale Redis data if available; fall back to most recent archive row
 
@@ -110,7 +110,7 @@ Aggregated from scanning ~15 downstream projects:
 
 **Paginated endpoints:** Detect `X-Pages > 1` on first page response, fan out remaining pages concurrently with a semaphore, merge `items[]` arrays in page order, and preserve response metadata from every page. Archive the merged result as a single snapshot only when all pages succeed for the same request generation. Return merged result to caller.
 
-**POST endpoints** (`/universe/names/`, `/universe/ids/`, `/characters/affiliation/`): Cache and archive individual ID→name mappings extracted from each batch response so future lookups for known IDs never hit ESI. Normalize/sort/dedupe request bodies before hashing cache keys, and split oversized batches before sending to ESI.
+**POST endpoints** (`/universe/names/`, `/universe/ids/`, `/characters/affiliation/`): Normalize/sort/dedupe request bodies before hashing batch-level cache keys; split oversized batches before sending to ESI. Additionally, extract and store each resolved ID→name mapping into a per-ID key namespace (`esi:{datasource}:name:{id}`) so future single-ID lookups hit the cache without re-batching. The batch key and the per-ID keys are separate: batch key caches the raw ESI response, per-ID keys enable individual lookups.
 
 ## Operational Requirements
 

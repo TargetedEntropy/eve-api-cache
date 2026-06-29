@@ -45,7 +45,34 @@ async def proxy(
     full_path = f"/{version}/{path}"
     method = request.method
     params = dict(request.query_params)
-    body = await request.body() if method == "POST" else None
+    body = None
+    if method == "POST":
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                declared_length = int(content_length)
+            except ValueError:
+                return Response(
+                    content=b'{"error":"invalid content-length"}',
+                    status_code=400,
+                    media_type="application/json",
+                    headers={"X-Cache": "ERROR"},
+                )
+            if declared_length > cfg.max_post_body_bytes:
+                return Response(
+                    content=b'{"error":"request body too large"}',
+                    status_code=413,
+                    media_type="application/json",
+                    headers={"X-Cache": "ERROR"},
+                )
+        body = await request.body()
+        if len(body) > cfg.max_post_body_bytes:
+            return Response(
+                content=b'{"error":"request body too large"}',
+                status_code=413,
+                media_type="application/json",
+                headers={"X-Cache": "ERROR"},
+            )
 
     result = await proxy_request(full_path, method, params, body, cache, esi, db, cfg)
 

@@ -20,6 +20,7 @@ class ArchiveType(str, Enum):
 
 
 VALID_VERSIONS = frozenset({"v1", "v2", "v3", "v4", "v5", "v6", "latest", "legacy", "dev"})
+VALID_DATASOURCES = frozenset({"tranquility", "singularity"})
 
 
 @dataclass
@@ -103,6 +104,11 @@ def validate_path(full_path: str) -> Optional[tuple[str, str]]:
     if version not in VALID_VERSIONS:
         return None
     return version, rest
+
+
+def validate_datasource(datasource: str) -> bool:
+    """Return True only for known ESI datasources."""
+    return datasource in VALID_DATASOURCES
 
 
 def match_endpoint(unversioned_path: str, method: str) -> Optional[EndpointSpec]:

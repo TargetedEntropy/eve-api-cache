@@ -14,6 +14,7 @@ Request flow:
 10. 4xx: pass through to caller
 """
 import hashlib
+import json
 import logging
 from dataclasses import dataclass
 from typing import Optional
@@ -27,6 +28,7 @@ from app.allowlist import (
     compute_query_hash,
     match_endpoint,
     normalize_params,
+    validate_datasource,
     validate_path,
 )
 from app.cache import CacheClient
@@ -66,8 +68,16 @@ async def proxy_request(
     if spec is None:
         return ProxyResult(404, b'{"error":"endpoint not in allowlist"}', "ERROR")
 
-    # --- 2. Build cache key ---
     datasource = params.get("datasource", settings.default_datasource)
+    if not validate_datasource(datasource):
+        return ProxyResult(400, b'{"error":"invalid datasource"}', "ERROR")
+
+    if method.upper() == "POST":
+        validation_error = _validate_post_body(body, settings.max_post_batch_items)
+        if validation_error:
+            return ProxyResult(400, validation_error, "ERROR")
+
+    # --- 2. Build cache key ---
     clean_params = normalize_params(params)
     query_hash = compute_query_hash(clean_params, body)
     cache_key = build_cache_key(datasource, method, full_path, params, body)
@@ -124,3 +134,25 @@ async def proxy_request(
 
     # --- 10. 4xx pass-through ---
     return ProxyResult(esi_resp.status, esi_resp.body, "MISS")
+
+
+def _validate_post_body(body: Optional[bytes], max_items: int) -> Optional[bytes]:
+    """Validate public ESI batch lookup bodies before forwarding or archiving."""
+    if not body:
+        return b'{"error":"POST body required"}'
+
+    try:
+        parsed = json.loads(body)
+    except (TypeError, ValueError):
+        return b'{"error":"invalid JSON body"}'
+
+    if not isinstance(parsed, list):
+        return b'{"error":"POST body must be a JSON list"}'
+
+    if len(parsed) > max_items:
+        return b'{"error":"POST batch too large"}'
+
+    if not all(isinstance(item, (int, str)) for item in parsed):
+        return b'{"error":"POST batch items must be strings or integers"}'
+
+    return None

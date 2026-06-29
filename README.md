@@ -37,9 +37,10 @@ APScheduler (background) → ESI upstream
 **Storage tiers:**
 - Redis — TTL matches ESI `Cache-Control`. Evicts naturally.
 - PostgreSQL — three write strategies by endpoint type:
-  - *Time-series* (market orders, system jumps/kills, sovereignty): append-only with retry idempotency
+  - *Time-series* (market orders, system jumps/kills, sovereignty): append-only metadata with compressed payload blobs
   - *Reference* (universe types, systems, corps): upsert on primary key
   - *Event* (killmails, contract items): insert-once, immutable
+- Filesystem archive — market-order snapshots are also written as zstd-compressed Parquet under `ARCHIVE_DATA_DIR`, with PostgreSQL manifest and delta tables for long-term storage efficiency.
 
 **Stampede protection** — identical in-flight upstream requests are coalesced; only one ESI call is made regardless of how many callers hit the same uncached key simultaneously.
 
@@ -133,9 +134,13 @@ Tests cover the cache layer, ESI client, proxy logic, background collector, and 
 | `DEFAULT_DATASOURCE` | `tranquility` | Default ESI datasource |
 | `MAX_POST_BODY_BYTES` | `65536` | Max accepted POST body size before forwarding to ESI |
 | `MAX_POST_BATCH_ITEMS` | `1000` | Max items in public ESI batch lookup requests |
-| `STALE_CACHE_SECONDS` | `86400` | How long Redis keeps stale bodies for degraded fallback |
+| `STALE_CACHE_SECONDS` | `3600` | How long Redis keeps stale bodies for degraded fallback |
+| `STALE_CACHE_MAX_BODY_BYTES` | `5000000` | Payloads larger than this skip Redis stale copies and use archive fallback |
 | `CLIENT_RATE_LIMIT_PER_MINUTE` | `600` | Per-client proxy request limit per process; `0` disables |
 | `COLLECTOR_ENABLED` | `true` | Start the in-process APScheduler collector |
+| `ARCHIVE_DATA_DIR` | `/var/lib/eve-api-cache/archive` | Filesystem root for Parquet archive files |
+| `ENABLE_MARKET_ORDER_PARQUET` | `true` | Write market-order snapshots to Parquet manifests |
+| `ENABLE_MARKET_ORDER_DELTAS` | `true` | Populate market-order version and snapshot-membership delta tables |
 | `MARKET_REGION_IDS` | `[10000002,...]` | Region IDs to backfill market orders for |
 | `POLL_MARKET_ORDERS_SECONDS` | `300` | Market order poll interval |
 | `POLL_MARKET_PRICES_SECONDS` | `3600` | Market prices poll interval |

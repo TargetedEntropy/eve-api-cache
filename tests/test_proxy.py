@@ -439,3 +439,26 @@ async def test_archive_write_failure_does_not_fail_proxy_response(
     assert result.cache_status == "MISS"
     assert result.body == b'[{"order_id":1}]'
     mock_db.rollback.assert_awaited_once()
+
+
+async def test_large_payload_skips_stale_redis_copy(
+    cache_client: CacheClient, mock_db, test_settings: Settings
+):
+    settings = test_settings.model_copy(update={"stale_cache_max_body_bytes": 10})
+    mock_esi = AsyncMock()
+    body = b'[{"order_id":1,"padding":"larger-than-threshold"}]'
+    mock_esi.fetch.return_value = make_esi_200(body)
+
+    with patch("app.archive.write_snapshot", new=AsyncMock()):
+        result = await proxy_request(
+            "/v1/markets/10000002/orders/", "GET",
+            {"order_type": "all"}, None,
+            cache_client, mock_esi, mock_db, settings,
+        )
+
+    key = build_cache_key(
+        "tranquility", "GET", "/v1/markets/10000002/orders/", {"order_type": "all"}, None
+    )
+    assert result.status == 200
+    assert await cache_client._r.get(f"esi:body:{key}") == body
+    assert await cache_client._r.get(f"esi:stale:{key}") is None

@@ -11,15 +11,32 @@ All writes are idempotent: duplicate retries produce no extra rows.
 """
 import json
 import hashlib
+import re
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.allowlist import ArchiveType
-from app.db import EventSnapshot, IdNameCache, ReferenceSnapshot, TimeSeriesSnapshot
+from app.config import settings
+from app.db import (
+    ArchiveObjectFile,
+    ArchivePayloadBlob,
+    EventSnapshot,
+    IdNameCache,
+    MarketOrderSnapshotEntry,
+    MarketOrderVersion,
+    ReferenceSnapshot,
+    TimeSeriesSnapshot,
+)
+
+_MARKET_ORDERS_RE = re.compile(r"^/[^/]+/markets/(\d+)/orders/?$")
+_STORAGE_JSONB = "jsonb"
+_STORAGE_COMPRESSED_JSON = "compressed_json"
+_STORAGE_MARKET_PARQUET_DELTA = "market_parquet_delta"
 
 
 async def write_snapshot(
@@ -39,11 +56,17 @@ async def write_snapshot(
         return
 
     now = datetime.now(timezone.utc)
-    payload_json = json.loads(payload)
 
     if archive_type == ArchiveType.TIME_SERIES:
+        await _write_payload_blob(session, content_hash, payload, now)
         idempotency_key = _timeseries_idempotency_key(
             datasource, path, query_hash, content_hash, now
+        )
+        is_market_orders = _market_orders_region_id(path) is not None
+        payload_storage = (
+            _STORAGE_MARKET_PARQUET_DELTA
+            if is_market_orders and settings.enable_market_order_parquet
+            else _STORAGE_COMPRESSED_JSON
         )
         stmt = pg_insert(TimeSeriesSnapshot).values(
             datasource=datasource,
@@ -51,17 +74,42 @@ async def write_snapshot(
             query_hash=query_hash,
             content_hash=content_hash,
             idempotency_key=idempotency_key,
-            payload=payload_json,
+            payload=None,
+            payload_storage=payload_storage,
             fetched_at=now,
             esi_expires_at=expires_at,
             etag=etag,
             http_status=http_status,
         ).on_conflict_do_nothing(
             constraint="uq_timeseries_idempotency"
-        )
-        await session.execute(stmt)
+        ).returning(TimeSeriesSnapshot.id)
+        result = await session.execute(stmt)
+        snapshot_id = result.scalar_one_or_none()
+        if snapshot_id is None:
+            snapshot_id = await _get_timeseries_id_by_idempotency_key(session, idempotency_key)
+
+        if snapshot_id and is_market_orders and settings.enable_market_order_parquet:
+            manifest_id = await _write_market_orders_parquet(
+                session=session,
+                snapshot_id=snapshot_id,
+                datasource=datasource,
+                path=path,
+                query_hash=query_hash,
+                content_hash=content_hash,
+                payload=payload,
+                fetched_at=now,
+            )
+            await session.execute(
+                update(TimeSeriesSnapshot)
+                .where(TimeSeriesSnapshot.id == snapshot_id)
+                .values(
+                    parquet_manifest_id=manifest_id,
+                    payload_storage=_STORAGE_MARKET_PARQUET_DELTA,
+                )
+            )
 
     elif archive_type == ArchiveType.REFERENCE:
+        payload_json = json.loads(payload)
         stmt = pg_insert(ReferenceSnapshot).values(
             datasource=datasource,
             path=path,
@@ -87,6 +135,7 @@ async def write_snapshot(
         await session.execute(stmt)
 
     elif archive_type == ArchiveType.EVENT:
+        payload_json = json.loads(payload)
         stmt = pg_insert(EventSnapshot).values(
             datasource=datasource,
             path=path,
@@ -155,9 +204,10 @@ async def get_latest_payload(
     Return the most recent archived payload for stale-fallback, or None.
     Checks time-series first (most recent by fetched_at), then reference, then events.
     """
-    # Time-series: most recent snapshot
+    # Time-series: most recent snapshot. Supports old inline JSONB rows and new
+    # compressed-blob rows during the storage migration.
     stmt = (
-        select(TimeSeriesSnapshot.payload)
+        select(TimeSeriesSnapshot)
         .where(
             TimeSeriesSnapshot.datasource == datasource,
             TimeSeriesSnapshot.path == path,
@@ -167,9 +217,17 @@ async def get_latest_payload(
         .limit(1)
     )
     row = await session.execute(stmt)
-    result = row.scalar_one_or_none()
-    if result is not None:
-        return json.dumps(result).encode()
+    snapshot = row.scalar_one_or_none()
+    if snapshot is not None:
+        if snapshot.payload is not None:
+            return json.dumps(snapshot.payload).encode()
+        blob = await session.get(ArchivePayloadBlob, snapshot.content_hash)
+        if blob is not None:
+            return _decompress_payload(blob.payload_codec, blob.payload_compressed)
+        if snapshot.parquet_manifest_id is not None:
+            manifest = await session.get(ArchiveObjectFile, snapshot.parquet_manifest_id)
+            if manifest is not None:
+                return _read_parquet_payload(manifest.file_path)
 
     # Reference: single upserted row
     stmt = select(ReferenceSnapshot.payload).where(
@@ -205,6 +263,224 @@ def _timeseries_idempotency_key(
     bucket = fetched_at.replace(second=0, microsecond=0)
     raw = "\0".join((datasource, path, query_hash, bucket.isoformat(), content_hash))
     return hashlib.sha256(raw.encode()).hexdigest()
+
+
+async def _get_timeseries_id_by_idempotency_key(
+    session: AsyncSession, idempotency_key: str
+) -> Optional[int]:
+    stmt = select(TimeSeriesSnapshot.id).where(TimeSeriesSnapshot.idempotency_key == idempotency_key)
+    row = await session.execute(stmt)
+    return row.scalar_one_or_none()
+
+
+async def _write_payload_blob(
+    session: AsyncSession,
+    content_hash: str,
+    payload: bytes,
+    created_at: datetime,
+) -> None:
+    codec, compressed = _compress_payload(payload)
+    stmt = pg_insert(ArchivePayloadBlob).values(
+        content_hash=content_hash,
+        payload_codec=codec,
+        payload_compressed=compressed,
+        raw_size=len(payload),
+        compressed_size=len(compressed),
+        storage_format="raw_json",
+        created_at=created_at,
+    ).on_conflict_do_nothing(
+        index_elements=["content_hash"]
+    )
+    await session.execute(stmt)
+
+
+def _compress_payload(payload: bytes) -> tuple[str, bytes]:
+    try:
+        import zstandard as zstd
+
+        return "zstd", zstd.ZstdCompressor(level=6).compress(payload)
+    except ImportError:
+        import zlib
+
+        return "zlib", zlib.compress(payload, level=9)
+
+
+def _decompress_payload(codec: str, payload: bytes) -> bytes:
+    if codec == "zstd":
+        import zstandard as zstd
+
+        return zstd.ZstdDecompressor().decompress(payload)
+    if codec == "zlib":
+        import zlib
+
+        return zlib.decompress(payload)
+    raise ValueError(f"unsupported archive payload codec: {codec}")
+
+
+async def _write_market_orders_parquet(
+    session: AsyncSession,
+    snapshot_id: int,
+    datasource: str,
+    path: str,
+    query_hash: str,
+    content_hash: str,
+    payload: bytes,
+    fetched_at: datetime,
+) -> int:
+    region_id = _market_orders_region_id(path)
+    if region_id is None:
+        raise ValueError(f"not a market-orders path: {path}")
+
+    orders = json.loads(payload)
+    if not isinstance(orders, list):
+        raise ValueError("market-orders payload must be a JSON list")
+
+    relative_path, stored_size = _write_market_orders_parquet_file(
+        datasource=datasource,
+        region_id=region_id,
+        content_hash=content_hash,
+        fetched_at=fetched_at,
+        orders=orders,
+    )
+
+    metadata = {"region_id": region_id, "snapshot_id": snapshot_id}
+    stmt = pg_insert(ArchiveObjectFile).values({
+        "content_hash": content_hash,
+        "datasource": datasource,
+        "path": path,
+        "query_hash": query_hash,
+        "fetched_at": fetched_at,
+        "storage_format": "parquet",
+        "codec": "zstd",
+        "file_path": relative_path,
+        "raw_size": len(payload),
+        "stored_size": stored_size,
+        "row_count": len(orders),
+        ArchiveObjectFile.__table__.c.metadata: metadata,
+        "created_at": fetched_at,
+    }).on_conflict_do_update(
+        index_elements=["content_hash"],
+        set_={
+            ArchiveObjectFile.file_path: relative_path,
+            ArchiveObjectFile.stored_size: stored_size,
+            ArchiveObjectFile.row_count: len(orders),
+            ArchiveObjectFile.__table__.c.metadata: metadata,
+        },
+    ).returning(ArchiveObjectFile.id)
+    result = await session.execute(stmt)
+    manifest_id = result.scalar_one()
+
+    if settings.enable_market_order_deltas:
+        await _write_market_order_deltas(
+            session=session,
+            snapshot_id=snapshot_id,
+            datasource=datasource,
+            region_id=region_id,
+            orders=orders,
+            fetched_at=fetched_at,
+        )
+
+    return manifest_id
+
+
+def _write_market_orders_parquet_file(
+    datasource: str,
+    region_id: int,
+    content_hash: str,
+    fetched_at: datetime,
+    orders: list[dict],
+) -> tuple[str, int]:
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except ImportError as exc:
+        raise RuntimeError("pyarrow is required for market-order Parquet archives") from exc
+
+    date_part = fetched_at.strftime("%Y-%m-%d")
+    timestamp_part = fetched_at.strftime("%Y%m%dT%H%M%SZ")
+    relative_path = Path(
+        "markets",
+        "orders",
+        f"datasource={datasource}",
+        f"region_id={region_id}",
+        f"date={date_part}",
+        f"snapshot_{timestamp_part}_{content_hash[:12]}.parquet",
+    )
+    full_path = Path(settings.archive_data_dir) / relative_path
+    full_path.parent.mkdir(parents=True, exist_ok=True)
+
+    table = pa.Table.from_pylist(orders) if orders else pa.table({})
+    pq.write_table(table, full_path, compression="zstd")
+    return str(relative_path), full_path.stat().st_size
+
+
+async def _write_market_order_deltas(
+    session: AsyncSession,
+    snapshot_id: int,
+    datasource: str,
+    region_id: int,
+    orders: list[dict],
+    fetched_at: datetime,
+) -> None:
+    version_rows = []
+    entry_rows = []
+    for order in orders:
+        if not isinstance(order, dict) or "order_id" not in order:
+            continue
+        order_id = int(order["order_id"])
+        version_hash = hashlib.sha256(
+            json.dumps(order, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        version_rows.append(
+            {
+                "datasource": datasource,
+                "order_id": order_id,
+                "version_hash": version_hash,
+                "payload": order,
+                "first_seen_at": fetched_at,
+                "last_seen_at": fetched_at,
+            }
+        )
+        entry_rows.append(
+            {
+                "snapshot_id": snapshot_id,
+                "order_id": order_id,
+                "version_hash": version_hash,
+                "region_id": region_id,
+            }
+        )
+
+    if version_rows:
+        version_stmt = pg_insert(MarketOrderVersion).values(version_rows)
+        version_stmt = version_stmt.on_conflict_do_update(
+            index_elements=["datasource", "order_id", "version_hash"],
+            set_=dict(last_seen_at=fetched_at),
+        )
+        await session.execute(version_stmt)
+
+    if entry_rows:
+        entry_stmt = pg_insert(MarketOrderSnapshotEntry).values(entry_rows)
+        entry_stmt = entry_stmt.on_conflict_do_nothing(
+            index_elements=["snapshot_id", "order_id"]
+        )
+        await session.execute(entry_stmt)
+
+
+def _market_orders_region_id(path: str) -> Optional[int]:
+    match = _MARKET_ORDERS_RE.match(path)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def _read_parquet_payload(file_path: str) -> bytes:
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as exc:
+        raise RuntimeError("pyarrow is required to read Parquet archive payloads") from exc
+
+    table = pq.read_table(Path(settings.archive_data_dir) / file_path)
+    return json.dumps(table.to_pylist()).encode()
 
 
 def _extract_name_mappings(data) -> list[tuple[int, str, Optional[str]]]:

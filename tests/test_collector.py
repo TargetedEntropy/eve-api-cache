@@ -174,11 +174,11 @@ async def test_universe_collectors(fn, expected_path, cache_client, mock_esi):
 # ---------------------------------------------------------------------------
 
 async def test_discover_type_ids_empty_archive():
-    with patch("app.collector.AsyncSessionLocal", _FakeSessionCM):
-        cm = _FakeSessionCM()
-        cm.session.execute.return_value = MagicMock(scalar_one_or_none=MagicMock(return_value=None))
-        with patch("app.collector.AsyncSessionLocal", lambda: cm):
-            result = await _discover_type_ids(10000002, "tranquility")
+    cm = _FakeSessionCM()
+    with patch("app.collector.AsyncSessionLocal", lambda: cm), patch(
+        "app.archive.get_latest_payload", new=AsyncMock(return_value=None)
+    ):
+        result = await _discover_type_ids(10000002, "tranquility")
 
     assert result == []
 
@@ -191,11 +191,9 @@ async def test_discover_type_ids_extracts_from_payload():
     ]
 
     cm = _FakeSessionCM()
-    mock_result = MagicMock()
-    mock_result.scalar_one_or_none.return_value = orders
-    cm.session.execute = AsyncMock(return_value=mock_result)
-
-    with patch("app.collector.AsyncSessionLocal", lambda: cm):
+    with patch("app.collector.AsyncSessionLocal", lambda: cm), patch(
+        "app.archive.get_latest_payload", new=AsyncMock(return_value=json.dumps(orders).encode())
+    ):
         result = await _discover_type_ids(10000002, "tranquility")
 
     assert set(result) == {34, 35}

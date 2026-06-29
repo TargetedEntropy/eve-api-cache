@@ -5,11 +5,10 @@ import uuid
 import pytest
 from sqlalchemy import delete, func, select, text
 
+import app.archive as archive
 from app.allowlist import ArchiveType
 from app.archive import get_latest_payload, write_names, write_snapshot
-from app.db import AsyncSessionLocal, IdNameCache, TimeSeriesSnapshot
-
-pytestmark = pytest.mark.postgres
+from app.db import ArchivePayloadBlob, AsyncSessionLocal, IdNameCache, TimeSeriesSnapshot
 
 
 class _FakeNameCache:
@@ -24,6 +23,40 @@ class _FakeNameCache:
         }
 
 
+def test_payload_compression_round_trip():
+    payload = (b'[{"order_id":1,"type_id":34,"price":12.3}]' * 100)
+    codec, compressed = archive._compress_payload(payload)
+
+    assert codec in {"zstd", "zlib"}
+    assert len(compressed) < len(payload)
+    assert archive._decompress_payload(codec, compressed) == payload
+
+
+def test_market_orders_parquet_file_write(tmp_path, monkeypatch):
+    pytest.importorskip("pyarrow")
+    monkeypatch.setattr(archive.settings, "archive_data_dir", str(tmp_path))
+
+    path, stored_size = archive._write_market_orders_parquet_file(
+        datasource="tranquility",
+        region_id=10000002,
+        content_hash="a" * 64,
+        fetched_at=archive.datetime(2026, 6, 29, 21, 0, tzinfo=archive.timezone.utc),
+        orders=[
+            {
+                "order_id": 1,
+                "type_id": 34,
+                "price": 5.0,
+                "volume_remain": 100,
+                "is_buy_order": False,
+            }
+        ],
+    )
+
+    assert path.endswith(".parquet")
+    assert (tmp_path / path).exists()
+    assert stored_size > 0
+
+
 @pytest.fixture
 async def postgres_archive():
     try:
@@ -35,6 +68,7 @@ async def postgres_archive():
         pytest.skip(f"PostgreSQL test database is unavailable: {exc}")
 
 
+@pytest.mark.postgres
 async def test_timeseries_write_is_idempotent_within_retry_bucket(postgres_archive):
     path = f"/v1/test/{uuid.uuid4()}/"
     payload = b'[{"order_id":1}]'
@@ -75,13 +109,19 @@ async def test_timeseries_write_is_idempotent_within_retry_bucket(postgres_archi
             )
             assert count == 1
             fallback = await get_latest_payload(session, "tranquility", path, "queryhash")
-            assert fallback == b'[{"order_id": 1}]'
+            assert fallback == payload
+
+            blob = await session.get(ArchivePayloadBlob, content_hash)
+            assert blob is not None
+            assert blob.raw_size == len(payload)
+            assert blob.compressed_size < blob.raw_size
     finally:
         async with AsyncSessionLocal() as session:
             await session.execute(delete(TimeSeriesSnapshot).where(TimeSeriesSnapshot.path == path))
             await session.commit()
 
 
+@pytest.mark.postgres
 async def test_write_names_extracts_universe_ids_object_response(postgres_archive):
     datasource = "tranquility"
     entity_ids = [99000001, 99000002]

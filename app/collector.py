@@ -11,15 +11,16 @@ so collector-populated keys are found on proxy cache lookups.
 """
 import asyncio
 import hashlib
+import json
 import logging
 from typing import Optional
 
 from app.allowlist import ArchiveType, build_cache_key, compute_query_hash
 from app.archive import write_snapshot
 from app.cache import CacheClient
-from app.db import AsyncSessionLocal, TimeSeriesSnapshot
+from app.config import settings
+from app.db import AsyncSessionLocal
 from app.esi_client import ESIClient
-from sqlalchemy import select
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +51,7 @@ async def _fetch_and_store(
 
     cache_key = build_cache_key(datasource, method, path, params, body)
     ttl = resp.max_age or 300
-    await cache.set(cache_key, resp.body, ttl, resp.etag)
+    await cache.set(cache_key, resp.body, ttl, resp.etag, _stale_ttl_for_payload(resp.body))
 
     query_hash = compute_query_hash(params, body)
     content_hash = hashlib.sha256(resp.body).hexdigest()
@@ -143,27 +144,29 @@ async def collect_market_history_for_region(
 
 async def _discover_type_ids(region_id: int, datasource: str) -> list[int]:
     """Return distinct type_ids from the most recent market-orders snapshot."""
+    from app.archive import get_latest_payload
+
     path = f"/v1/markets/{region_id}/orders/"
     query_hash = compute_query_hash({"order_type": "all"}, None)
 
     async with AsyncSessionLocal() as session:
-        stmt = (
-            select(TimeSeriesSnapshot.payload)
-            .where(
-                TimeSeriesSnapshot.datasource == datasource,
-                TimeSeriesSnapshot.path == path,
-                TimeSeriesSnapshot.query_hash == query_hash,
-            )
-            .order_by(TimeSeriesSnapshot.fetched_at.desc())
-            .limit(1)
-        )
-        row = await session.execute(stmt)
-        payload = row.scalar_one_or_none()
+        raw_payload = await get_latest_payload(session, datasource, path, query_hash)
 
-    if not payload or not isinstance(payload, list):
+    if raw_payload is None:
+        return []
+
+    try:
+        payload = json.loads(raw_payload)
+    except (TypeError, ValueError):
         return []
 
     return list({int(o["type_id"]) for o in payload if isinstance(o, dict) and "type_id" in o})
+
+
+def _stale_ttl_for_payload(body: bytes) -> int:
+    if settings.stale_cache_max_body_bytes > 0 and len(body) > settings.stale_cache_max_body_bytes:
+        return 0
+    return settings.stale_cache_seconds
 
 
 # ---------------------------------------------------------------------------

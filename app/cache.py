@@ -43,7 +43,10 @@ class CacheClient:
         """Store body with TTL, plus a bounded stale copy for degraded-mode fallback."""
         pipe = self._r.pipeline()
         pipe.set(f"esi:body:{key}", body, ex=ttl)
-        pipe.set(f"esi:stale:{key}", body, ex=ttl + stale_ttl)
+        if stale_ttl > 0:
+            pipe.set(f"esi:stale:{key}", body, ex=ttl + stale_ttl)
+        else:
+            pipe.delete(f"esi:stale:{key}")
         if etag:
             pipe.set(f"esi:etag:{key}", etag, ex=ttl + 60)
         else:

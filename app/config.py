@@ -16,9 +16,13 @@ class Settings(BaseSettings):
     default_datasource: str = "tranquility"
     max_post_body_bytes: int = 65536
     max_post_batch_items: int = 1000
-    stale_cache_seconds: int = 86400
+    stale_cache_seconds: int = 3600
+    stale_cache_max_body_bytes: int = 5_000_000
     client_rate_limit_per_minute: int = 600
     collector_enabled: bool = True
+    archive_data_dir: str = "/var/lib/eve-api-cache/archive"
+    enable_market_order_parquet: bool = True
+    enable_market_order_deltas: bool = True
 
     # Collector — which regions to proactively poll for market data.
     # Defaults: The Forge (Jita), Domain (Amarr), Heimatar (Rens),

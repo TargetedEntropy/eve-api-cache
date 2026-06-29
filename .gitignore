@@ -12,6 +12,7 @@ build/
 
 # Environment
 .env
+deploy.md
 
 # Pytest / coverage
 .pytest_cache/

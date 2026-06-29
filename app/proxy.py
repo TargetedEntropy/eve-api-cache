@@ -114,7 +114,7 @@ async def proxy_request(
                 stale_body,
                 ttl,
                 esi_resp.etag or stored_etag,
-                settings.stale_cache_seconds,
+                _stale_ttl_for_payload(stale_body, settings),
             )
             return ProxyResult(200, stale_body, "MISS")
 
@@ -131,7 +131,7 @@ async def proxy_request(
             esi_resp.body,
             ttl,
             esi_resp.etag,
-            settings.stale_cache_seconds,
+            _stale_ttl_for_payload(esi_resp.body, settings),
         )
 
         await _archive_response(
@@ -212,3 +212,9 @@ async def _archive_response(
     except Exception:
         await db.rollback()
         logger.exception("Archive write failed for %s", full_path)
+
+
+def _stale_ttl_for_payload(body: bytes, settings: Settings) -> int:
+    if settings.stale_cache_max_body_bytes > 0 and len(body) > settings.stale_cache_max_body_bytes:
+        return 0
+    return settings.stale_cache_seconds

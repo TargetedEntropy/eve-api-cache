@@ -1,0 +1,174 @@
+{
+  "testModules": [
+    {
+      "moduleId": "tests/test_cache.py",
+      "tests": [
+        {
+          "name": "test_set_and_get_returns_body_and_etag",
+          "fullName": "tests/test_cache.py::test_set_and_get_returns_body_and_etag",
+          "state": "passed"
+        },
+        {
+          "name": "test_get_missing_returns_none",
+          "fullName": "tests/test_cache.py::test_get_missing_returns_none",
+          "state": "passed"
+        },
+        {
+          "name": "test_set_without_etag",
+          "fullName": "tests/test_cache.py::test_set_without_etag",
+          "state": "passed"
+        },
+        {
+          "name": "test_etag_key_has_longer_ttl_than_body",
+          "fullName": "tests/test_cache.py::test_etag_key_has_longer_ttl_than_body",
+          "state": "passed"
+        },
+        {
+          "name": "test_set_without_etag_does_not_write_etag_key",
+          "fullName": "tests/test_cache.py::test_set_without_etag_does_not_write_etag_key",
+          "state": "passed"
+        },
+        {
+          "name": "test_refresh_ttl_extends_expiry",
+          "fullName": "tests/test_cache.py::test_refresh_ttl_extends_expiry",
+          "state": "passed"
+        },
+        {
+          "name": "test_name_round_trip",
+          "fullName": "tests/test_cache.py::test_name_round_trip",
+          "state": "passed"
+        },
+        {
+          "name": "test_get_name_missing_returns_none",
+          "fullName": "tests/test_cache.py::test_get_name_missing_returns_none",
+          "state": "passed"
+        },
+        {
+          "name": "test_name_key_layout",
+          "fullName": "tests/test_cache.py::test_name_key_layout",
+          "state": "passed"
+        },
+        {
+          "name": "test_name_ttl_defaults_to_24h",
+          "fullName": "tests/test_cache.py::test_name_ttl_defaults_to_24h",
+          "state": "passed"
+        },
+        {
+          "name": "test_name_custom_ttl",
+          "fullName": "tests/test_cache.py::test_name_custom_ttl",
+          "state": "passed"
+        },
+        {
+          "name": "test_get_returns_none_after_body_expires",
+          "fullName": "tests/test_cache.py::test_get_returns_none_after_body_expires",
+          "state": "passed"
+        }
+      ]
+    },
+    {
+      "moduleId": "tests/test_esi_client.py",
+      "tests": [
+        {
+          "name": "test_simple_get_returns_body_etag_max_age",
+          "fullName": "tests/test_esi_client.py::test_simple_get_returns_body_etag_max_age",
+          "state": "passed"
+        },
+        {
+          "name": "test_pagination_merges_all_pages",
+          "fullName": "tests/test_esi_client.py::test_pagination_merges_all_pages",
+          "state": "passed"
+        },
+        {
+          "name": "test_304_not_modified_preserves_original_etag",
+          "fullName": "tests/test_esi_client.py::test_304_not_modified_preserves_original_etag",
+          "state": "passed"
+        },
+        {
+          "name": "test_post_returns_body_without_pagination",
+          "fullName": "tests/test_esi_client.py::test_post_returns_body_without_pagination",
+          "state": "passed"
+        },
+        {
+          "name": "test_5xx_returned_without_raising",
+          "fullName": "tests/test_esi_client.py::test_5xx_returned_without_raising",
+          "state": "passed"
+        },
+        {
+          "name": "test_error_limit_headers_parsed",
+          "fullName": "tests/test_esi_client.py::test_error_limit_headers_parsed",
+          "state": "passed"
+        },
+        {
+          "name": "test_pagination_partial_failure_returns_500",
+          "fullName": "tests/test_esi_client.py::test_pagination_partial_failure_returns_500",
+          "state": "passed"
+        },
+        {
+          "name": "test_get_404_returned_directly",
+          "fullName": "tests/test_esi_client.py::test_get_404_returned_directly",
+          "state": "passed"
+        },
+        {
+          "name": "test_max_age_parsed_from_expires_header",
+          "fullName": "tests/test_esi_client.py::test_max_age_parsed_from_expires_header",
+          "state": "passed"
+        }
+      ]
+    },
+    {
+      "moduleId": "tests/test_proxy.py",
+      "tests": [
+        {
+          "name": "test_cache_hit",
+          "fullName": "tests/test_proxy.py::test_cache_hit",
+          "state": "passed"
+        },
+        {
+          "name": "test_cache_miss_esi_200",
+          "fullName": "tests/test_proxy.py::test_cache_miss_esi_200",
+          "state": "passed"
+        },
+        {
+          "name": "test_cache_miss_esi_500_archive_fallback",
+          "fullName": "tests/test_proxy.py::test_cache_miss_esi_500_archive_fallback",
+          "state": "passed"
+        },
+        {
+          "name": "test_cache_miss_esi_500_no_archive",
+          "fullName": "tests/test_proxy.py::test_cache_miss_esi_500_no_archive",
+          "state": "passed"
+        },
+        {
+          "name": "test_invalid_path_traversal",
+          "fullName": "tests/test_proxy.py::test_invalid_path_traversal",
+          "state": "passed"
+        },
+        {
+          "name": "test_unlisted_path_returns_404",
+          "fullName": "tests/test_proxy.py::test_unlisted_path_returns_404",
+          "state": "passed"
+        },
+        {
+          "name": "test_esi_404_passthrough",
+          "fullName": "tests/test_proxy.py::test_esi_404_passthrough",
+          "state": "passed"
+        },
+        {
+          "name": "test_datasource_param_changes_cache_key",
+          "fullName": "tests/test_proxy.py::test_datasource_param_changes_cache_key",
+          "state": "passed"
+        },
+        {
+          "name": "test_esi_200_calls_write_snapshot",
+          "fullName": "tests/test_proxy.py::test_esi_200_calls_write_snapshot",
+          "state": "passed"
+        },
+        {
+          "name": "test_esi_200_no_snapshot_for_none_archive_type",
+          "fullName": "tests/test_proxy.py::test_esi_200_no_snapshot_for_none_archive_type",
+          "state": "passed"
+        }
+      ]
+    }
+  ]
+}

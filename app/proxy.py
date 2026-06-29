@@ -1,0 +1,126 @@
+"""
+Core proxy logic: cache → ESI → archive.
+
+Request flow:
+1. Validate path against allowlist (security gate)
+2. Build cache key from datasource + method + path + params/body hash
+3. Check Redis hot cache → return HIT immediately
+4. Recover ETag from Redis (outlives the body key by 60s) for conditional request
+5. Coalesce identical in-flight requests (stampede protection)
+6. Fetch ESI with If-None-Match if ETag known
+7. 304: body was evicted but ESI confirms content unchanged; re-fetch without ETag
+8. 200: store in Redis + write to PostgreSQL archive, return body
+9. 5xx: return stale Redis data or archive fallback
+10. 4xx: pass through to caller
+"""
+import hashlib
+import logging
+from dataclasses import dataclass
+from typing import Optional
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
+import app.archive as archive
+from app.allowlist import (
+    ArchiveType,
+    build_cache_key,
+    compute_query_hash,
+    match_endpoint,
+    normalize_params,
+    validate_path,
+)
+from app.cache import CacheClient
+from app.coalesce import coalesce
+from app.config import Settings
+from app.esi_client import ESIClient
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ProxyResult:
+    status: int
+    body: bytes
+    cache_status: str  # "HIT", "MISS", "STALE", "ARCHIVE_FALLBACK", "ERROR"
+    content_type: str = "application/json"
+
+
+async def proxy_request(
+    full_path: str,       # e.g. "/v1/markets/10000002/orders/"
+    method: str,
+    params: dict,
+    body: Optional[bytes],
+    cache: CacheClient,
+    esi: ESIClient,
+    db: AsyncSession,
+    settings: Settings,
+) -> ProxyResult:
+
+    # --- 1. Security: validate path ---
+    validated = validate_path(full_path)
+    if validated is None:
+        return ProxyResult(400, b'{"error":"invalid path"}', "ERROR")
+
+    _version, rest_path = validated
+    spec = match_endpoint(rest_path, method)
+    if spec is None:
+        return ProxyResult(404, b'{"error":"endpoint not in allowlist"}', "ERROR")
+
+    # --- 2. Build cache key ---
+    datasource = params.get("datasource", settings.default_datasource)
+    clean_params = normalize_params(params)
+    query_hash = compute_query_hash(clean_params, body)
+    cache_key = build_cache_key(datasource, method, full_path, params, body)
+
+    # --- 3. Redis hot cache ---
+    cached = await cache.get(cache_key)
+    if cached is not None:
+        return ProxyResult(200, cached[0], "HIT")
+
+    # --- 4. Recover ETag for conditional request ---
+    # ETag outlives the body key (TTL + 60s buffer in cache.set), so even after
+    # body eviction we can send If-None-Match to avoid re-downloading unchanged payloads.
+    raw_etag = await cache._r.get(f"esi:etag:{cache_key}")
+    stored_etag: Optional[str] = raw_etag.decode() if raw_etag else None
+
+    # --- 5. Coalesced ESI fetch (stampede protection) ---
+    async def do_fetch():
+        return await esi.fetch(full_path, method, clean_params, body, stored_etag)
+
+    esi_resp = await coalesce(cache_key, do_fetch)
+
+    # --- 7. 304 Not Modified ---
+    if esi_resp.not_modified:
+        # Body was evicted from Redis but ESI confirms content is unchanged.
+        # We have no body to serve, so re-fetch without ETag to repopulate cache.
+        logger.debug("304 but body evicted; re-fetching %s without ETag", full_path)
+        esi_resp = await esi.fetch(full_path, method, clean_params, body, None)
+
+    # --- 8. ESI 200 ---
+    if esi_resp.status == 200:
+        ttl = esi_resp.max_age or 300
+        await cache.set(cache_key, esi_resp.body, ttl, esi_resp.etag)
+
+        if spec.archive_type != ArchiveType.NONE:
+            content_hash = hashlib.sha256(esi_resp.body).hexdigest()
+            await archive.write_snapshot(
+                db, datasource, full_path, query_hash, content_hash,
+                esi_resp.body, 200, esi_resp.etag, esi_resp.expires_at,
+                spec.archive_type,
+            )
+
+        if spec.extract_names:
+            await archive.write_names(db, cache, datasource, esi_resp.body)
+
+        return ProxyResult(200, esi_resp.body, "MISS")
+
+    # --- 9. ESI 5xx: stale/archive fallback ---
+    if esi_resp.status >= 500:
+        logger.warning("ESI %s for %s; serving archive fallback", esi_resp.status, full_path)
+        archive_body = await archive.get_latest_payload(db, datasource, full_path, query_hash)
+        if archive_body:
+            return ProxyResult(200, archive_body, "ARCHIVE_FALLBACK")
+        return ProxyResult(esi_resp.status, esi_resp.body, "ERROR")
+
+    # --- 10. 4xx pass-through ---
+    return ProxyResult(esi_resp.status, esi_resp.body, "MISS")

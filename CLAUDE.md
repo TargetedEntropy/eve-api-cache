@@ -13,6 +13,17 @@ Data is **never deleted from the archive**. Redis provides the hot-cache layer (
 
 **Phase 1 scope:** Public (no-auth) ESI endpoints only — markets, universe, contracts, sovereignty, incursions, killmails, and public character/corp/alliance info.
 
+## Current Repository State
+
+This repository currently contains the project guidance/spec only. Before following the development commands below, first add the actual FastAPI project scaffold, dependency metadata, tests, migrations, and deployment files. Do not assume `app.main`, `pyproject.toml`, Alembic migrations, or test modules already exist until they are present in the repo.
+
+When bootstrapping the project, keep the first implementation small and verifiable:
+- `GET /healthz`
+- one cached/proxied ESI endpoint
+- Redis TTL behavior from ESI headers
+- one archive write path in PostgreSQL
+- tests proving cache hit, cache miss, archive insert, and stale fallback behavior
+
 ## ESI Fundamentals
 
 **Base URL:** `https://esi.evetech.net`
@@ -110,6 +121,26 @@ Aggregated from scanning ~15 downstream projects:
 **Paginated endpoints:** Detect `X-Pages > 1` on first page response, fan out remaining pages concurrently with `asyncio.gather`, merge `items[]` arrays. Archive the merged result as a single snapshot. Return merged result to caller.
 
 **POST endpoints** (`/universe/names/`, `/universe/ids/`, `/characters/affiliation/`): Cache and archive individual ID→name mappings extracted from each batch response so future lookups for known IDs never hit ESI.
+
+## Proxy Safety Requirements
+
+This service must not become a general-purpose open proxy. Only proxy requests to the canonical ESI host, and only for explicitly allowed public endpoint patterns.
+
+Security rules:
+- Never accept a caller-supplied upstream hostname, scheme, or full URL.
+- Reject paths containing `..`, encoded path traversal, backslashes, control characters, or duplicate/ambiguous slashes.
+- Preserve ESI path versions, but validate the first path segment is one of the supported ESI versions.
+- Keep a route allowlist for Phase 1 public endpoints. Return 404/403 for unknown paths instead of blindly forwarding them.
+- Reject private/authenticated ESI endpoints until OAuth, token storage, and per-user authorization are designed separately.
+- Enforce request body size limits for POST batch endpoints and validate batch lengths before forwarding to ESI.
+- Add per-client rate limiting and upstream concurrency caps so one downstream service cannot burn the shared ESI error budget.
+- Do not log access tokens, cookies, request bodies for batch lookups, or full upstream error payloads if they may contain caller data.
+
+Reliability rules:
+- Coalesce identical in-flight upstream requests so cache stampedes do not fan out to ESI.
+- Use bounded `asyncio.gather` concurrency for paginated endpoints.
+- Store ESI response metadata with archive rows where useful: status, ETag, Expires, Cache-Control, datasource, request key, and fetched_at.
+- Treat stale Redis/archive fallback as degraded mode and mark responses with headers such as `X-Cache: STALE` or `X-Archive-Fallback: true`.
 
 ## Development Setup
 

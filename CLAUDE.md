@@ -15,14 +15,9 @@ Data is **never deleted from the archive**. Redis provides the hot-cache layer (
 
 ## Current Repository State
 
-This repository currently contains the project guidance/spec only. Before following the development commands below, first add the actual FastAPI project scaffold, dependency metadata, tests, migrations, and deployment files. Do not assume `app.main`, `pyproject.toml`, Alembic migrations, or test modules already exist until they are present in the repo.
+This repository now contains the initial FastAPI implementation, dependency metadata, Alembic schema, background collector, and tests. Before replacing or restructuring anything, inspect the existing files under `app/`, `tests/`, and `alembic/` and extend them in place unless there is a strong reason not to.
 
-When bootstrapping the project, keep the first implementation small and verifiable:
-- `GET /healthz`
-- one cached/proxied ESI endpoint
-- Redis TTL behavior from ESI headers
-- one archive write path in PostgreSQL
-- tests proving cache hit, cache miss, archive insert, and stale fallback behavior
+Keep future changes small and verifiable. Any new endpoint, collector job, archive table, or request path should include tests proving cache hit/miss behavior, archive write behavior, stale fallback behavior where relevant, and input validation before ESI is contacted.
 
 ## ESI Fundamentals
 
@@ -130,6 +125,17 @@ Aggregated from scanning ~15 downstream projects:
 - **Make archive writes idempotent:** database constraints should prevent duplicate rows for the same datasource, endpoint identity, natural key or `(fetched_at bucket, content_hash)` as appropriate. Retries must not multiply history.
 - **Store enough provenance to trust the archive:** endpoint, versioned path, normalized query/body hash, datasource, fetched_at, ESI expiry/cache headers, ETag/Last-Modified, HTTP status, and payload/content hash.
 - **Do not fabricate fixtures as live data.** Tests may use recorded fixtures, but runtime responses must clearly distinguish live ESI, hot cache, stale cache, and archive fallback.
+
+## Data Risk Requirements
+
+The archive contains public ESI data, but aggregated public data can still expose behavioral patterns. Treat Redis, PostgreSQL, backups, exports, and operational logs as sensitive service data.
+
+- **Public info can still profile players.** Character public info, corporation history, affiliations, contracts, killmails, and market behavior can become more sensitive once aggregated over time. Do not add OAuth scopes, private endpoints, token storage, assets, wallets, mail, locations, contacts, or other authenticated character data without a separate design review.
+- **Permanent archive needs governance.** The project goal is durable history, not casual deletion. If removal, correction, legal compliance, or operator-requested pruning is ever needed, build a deliberate admin process with audit logging instead of ad hoc SQL edits or application-side deletes.
+- **Protect raw archive access.** Do not add broad public query endpoints over `archive_timeseries`, `archive_reference`, `archive_events`, or `id_name_cache`. Analytics APIs should be narrow, rate-limited, and reviewed as a separate surface from the ESI proxy.
+- **Backups inherit production sensitivity.** Any deployment guidance should require encrypted backups, restricted restore/export access, and a documented retention/restore process.
+- **Logs must not become a shadow archive.** Do not log POST request bodies, full upstream payloads, Redis values, database URLs, or high-cardinality caller-supplied IDs beyond what is needed for operational debugging.
+- **Validate archive namespace inputs.** Only known ESI datasources should be accepted, and batch bodies should be size/item-count limited before cache keys, upstream requests, or archive writes are created.
 
 ## Proxy Safety Requirements
 

@@ -242,7 +242,62 @@ async def test_datasource_param_changes_cache_key(
 
 
 # ---------------------------------------------------------------------------
-# Test 9: ESI 200 triggers write_snapshot for archiveable endpoints
+# Test 9: Invalid datasource → 400 ERROR, never reaches ESI
+# ---------------------------------------------------------------------------
+
+async def test_invalid_datasource_rejected(
+    cache_client: CacheClient, mock_esi, mock_db, test_settings: Settings
+):
+    """Only known ESI datasources may create cache/archive namespaces."""
+    result = await proxy_request(
+        "/v1/status/", "GET", {"datasource": "totally-real"}, None,
+        cache_client, mock_esi, mock_db, test_settings,
+    )
+    assert result.status == 400
+    assert result.cache_status == "ERROR"
+    assert result.body == b'{"error":"invalid datasource"}'
+    mock_esi.fetch.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Test 10: Invalid POST body → 400 ERROR, never reaches ESI
+# ---------------------------------------------------------------------------
+
+async def test_invalid_post_body_rejected(
+    cache_client: CacheClient, mock_esi, mock_db, test_settings: Settings
+):
+    """Batch POST endpoints require a JSON list before forwarding."""
+    result = await proxy_request(
+        "/v1/universe/names/", "POST", {}, b'{"id":123}',
+        cache_client, mock_esi, mock_db, test_settings,
+    )
+    assert result.status == 400
+    assert result.cache_status == "ERROR"
+    assert result.body == b'{"error":"POST body must be a JSON list"}'
+    mock_esi.fetch.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Test 11: Oversized POST batch → 400 ERROR, never reaches ESI
+# ---------------------------------------------------------------------------
+
+async def test_oversized_post_batch_rejected(
+    cache_client: CacheClient, mock_esi, mock_db, test_settings: Settings
+):
+    """Batch POST endpoints are capped before forwarding or archiving."""
+    body = ("[" + ",".join(str(i) for i in range(test_settings.max_post_batch_items + 1)) + "]").encode()
+    result = await proxy_request(
+        "/v1/universe/names/", "POST", {}, body,
+        cache_client, mock_esi, mock_db, test_settings,
+    )
+    assert result.status == 400
+    assert result.cache_status == "ERROR"
+    assert result.body == b'{"error":"POST batch too large"}'
+    mock_esi.fetch.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Test 12: ESI 200 triggers write_snapshot for archiveable endpoints
 # ---------------------------------------------------------------------------
 
 async def test_esi_200_calls_write_snapshot(
@@ -264,7 +319,7 @@ async def test_esi_200_calls_write_snapshot(
 
 
 # ---------------------------------------------------------------------------
-# Test 10: /status/ endpoint is proxy-only — write_snapshot is NOT called
+# Test 13: /status/ endpoint is proxy-only — write_snapshot is NOT called
 # ---------------------------------------------------------------------------
 
 async def test_esi_200_no_snapshot_for_none_archive_type(

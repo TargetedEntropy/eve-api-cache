@@ -11,6 +11,8 @@ class Settings(BaseSettings):
     esi_timeout: float = 30.0
     page_concurrency: int = 10
     default_datasource: str = "tranquility"
+    max_post_body_bytes: int = 65536
+    max_post_batch_items: int = 1000
 
     # Collector — which regions to proactively poll for market data.
     # Defaults: The Forge (Jita), Domain (Amarr), Heimatar (Rens),

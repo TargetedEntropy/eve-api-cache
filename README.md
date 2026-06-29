@@ -10,6 +10,18 @@ Unauthenticated ESI proxy and permanent historical archive for the [EVE Online E
 
 Phase 1 covers public (no-auth) endpoints only: markets, universe, contracts, sovereignty, incursions, killmails, and public character/corp/alliance info.
 
+## Data risk notes
+
+This service archives only public ESI data, but public does not mean harmless once it is aggregated, indexed, and retained forever. Treat the PostgreSQL archive and Redis cache as sensitive operational data.
+
+Primary risks and mitigations:
+- **Character/corporation profiling:** public character, corporation history, affiliation, contract, and killmail data can reveal player activity patterns when aggregated. Do not add private/authenticated ESI scopes without a separate privacy and access-control design.
+- **Permanent retention:** time-series history is intentionally long-lived. Any archive pruning, correction, legal request, or operator-requested removal needs a deliberate admin process; do not casually delete rows from normal application code.
+- **Archive exposure:** never expose raw database access or broad archive-dump endpoints to public callers. Any future analytics API should be scoped, rate-limited, and reviewed separately from the ESI proxy surface.
+- **Backups and exports:** database backups inherit the same sensitivity as production. Encrypt backups, restrict who can download them, and document restore/export handling before production use.
+- **Logs:** do not log request bodies for POST batch endpoints, full upstream payloads, Redis values, database URLs, or caller-supplied IDs at high cardinality. Keep logs useful for operations without becoming a second archive.
+- **Datasource integrity:** only known ESI datasources are accepted. Unknown datasource strings are rejected so callers cannot create arbitrary cache/archive namespaces.
+
 ## Architecture
 
 ```
@@ -116,6 +128,8 @@ pytest
 | `ESI_TIMEOUT` | `30.0` | ESI request timeout (seconds) |
 | `PAGE_CONCURRENCY` | `10` | Max concurrent page fetches per paginated request |
 | `DEFAULT_DATASOURCE` | `tranquility` | Default ESI datasource |
+| `MAX_POST_BODY_BYTES` | `65536` | Max accepted POST body size before forwarding to ESI |
+| `MAX_POST_BATCH_ITEMS` | `1000` | Max items in public ESI batch lookup requests |
 | `MARKET_REGION_IDS` | `[10000002,...]` | Region IDs to backfill market orders for |
 | `POLL_MARKET_ORDERS_SECONDS` | `300` | Market order poll interval |
 | `POLL_MARKET_PRICES_SECONDS` | `3600` | Market prices poll interval |

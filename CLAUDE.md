@@ -13,6 +13,17 @@ Data is **never deleted from the archive**. Redis provides the hot-cache layer (
 
 **Phase 1 scope:** Public (no-auth) ESI endpoints only — markets, universe, contracts, sovereignty, incursions, killmails, and public character/corp/alliance info. Do not add OAuth flows, token storage, or private-character scopes in this project unless the scope is deliberately expanded later.
 
+## Current Repository State
+
+This repository currently contains the project guidance/spec only. Before following the development commands below, first add the actual FastAPI project scaffold, dependency metadata, tests, migrations, and deployment files. Do not assume `app.main`, `pyproject.toml`, Alembic migrations, or test modules already exist until they are present in the repo.
+
+When bootstrapping the project, keep the first implementation small and verifiable:
+- `GET /healthz`
+- one cached/proxied ESI endpoint
+- Redis TTL behavior from ESI headers
+- one archive write path in PostgreSQL
+- tests proving cache hit, cache miss, archive insert, and stale fallback behavior
+
 ## ESI Fundamentals
 
 **Base URL:** `https://esi.evetech.net`
@@ -119,6 +130,26 @@ Aggregated from scanning ~15 downstream projects:
 - **Make archive writes idempotent:** database constraints should prevent duplicate rows for the same datasource, endpoint identity, natural key or `(fetched_at bucket, content_hash)` as appropriate. Retries must not multiply history.
 - **Store enough provenance to trust the archive:** endpoint, versioned path, normalized query/body hash, datasource, fetched_at, ESI expiry/cache headers, ETag/Last-Modified, HTTP status, and payload/content hash.
 - **Do not fabricate fixtures as live data.** Tests may use recorded fixtures, but runtime responses must clearly distinguish live ESI, hot cache, stale cache, and archive fallback.
+
+## Proxy Safety Requirements
+
+This service must not become a general-purpose open proxy. Only proxy requests to the canonical ESI host, and only for explicitly allowed public endpoint patterns.
+
+Security rules:
+- Never accept a caller-supplied upstream hostname, scheme, or full URL.
+- Reject paths containing `..`, encoded path traversal, backslashes, control characters, or duplicate/ambiguous slashes.
+- Preserve ESI path versions, but validate the first path segment is one of the supported ESI versions.
+- Keep a route allowlist for Phase 1 public endpoints. Return 404/403 for unknown paths instead of blindly forwarding them.
+- Reject private/authenticated ESI endpoints until OAuth, token storage, and per-user authorization are designed separately.
+- Enforce request body size limits for POST batch endpoints and validate batch lengths before forwarding to ESI.
+- Add per-client rate limiting and upstream concurrency caps so one downstream service cannot burn the shared ESI error budget.
+- Do not log access tokens, cookies, request bodies for batch lookups, or full upstream error payloads if they may contain caller data.
+
+Reliability rules:
+- Coalesce identical in-flight upstream requests so cache stampedes do not fan out to ESI.
+- Use a semaphore to bound concurrency for paginated endpoint fan-out.
+- Store ESI response metadata with archive rows where useful: status, ETag, Expires, Cache-Control, datasource, request key, and fetched_at.
+- Treat stale Redis/archive fallback as degraded mode and mark responses with headers such as `X-Cache: STALE` or `X-Archive-Fallback: true`.
 
 ## Development Setup
 

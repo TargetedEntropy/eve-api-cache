@@ -4,7 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Purpose
 
-`eve-api-cache` is an unauthenticated caching reverse proxy for the [EVE Online ESI API](https://esi.evetech.net). It acts as a local/shared cache layer so downstream apps (eve-nexum, eve-emptiness, eve-purple, etc.) can call this service instead of hitting ESI directly, reducing rate-limit pressure and improving response times.
+`eve-api-cache` is an unauthenticated ESI proxy and **permanent historical archive** for the [EVE Online ESI API](https://esi.evetech.net). It serves two inseparable roles:
+
+1. **Proxy cache** — downstream apps (eve-nexum, eve-emptiness, eve-purple, etc.) call this service instead of ESI directly, reducing rate-limit pressure and latency.
+2. **Historical archive** — ESI data is ephemeral. Market orders vanish when they fill or expire. System jump/kill stats are only available as a rolling snapshot. Market history is capped at ~13 months. Sovereignty maps overwrite themselves. This service persists every snapshot it collects indefinitely so that long-term analysis is possible.
+
+Data is **never deleted from the archive**. Redis provides the hot-cache layer (short TTL, respects ESI cache headers). A persistent database provides the archive layer (no expiry, append-only for time-series data).
 
 **Phase 1 scope:** Public (no-auth) ESI endpoints only — markets, universe, contracts, sovereignty, incursions, killmails, and public character/corp/alliance info.
 
@@ -33,12 +38,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Aggregated from scanning ~15 downstream projects:
 
-**Markets** (highest cache value — shared across all trading tools)
-- `GET /markets/{region_id}/orders/` — paginated, ~5 min TTL
-- `GET /markets/{region_id}/history/` — per type, ~24 hr TTL
-- `GET /markets/prices/` — adjusted/average prices, ~24 hr TTL
+**Markets** (highest archive value — time-series snapshots build long-term price history)
+- `GET /markets/{region_id}/orders/` — paginated; snapshot every ~5 min, archive each snapshot with timestamp
+- `GET /markets/{region_id}/history/` — ESI only exposes ~13 months; archive permanently to extend coverage indefinitely
+- `GET /markets/prices/` — adjusted/average prices; archive each daily snapshot
 
-**Universe** (near-static, long TTL)
+**Universe** (near-static reference data)
 - `GET /universe/types/{type_id}/`
 - `GET /universe/systems/`, `/universe/systems/{system_id}/`
 - `GET /universe/regions/`, `/universe/regions/{region_id}/`
@@ -48,8 +53,8 @@ Aggregated from scanning ~15 downstream projects:
 - `GET /universe/stars/{star_id}/`
 - `GET /universe/factions/`
 - `GET /universe/groups/{group_id}/`
-- `GET /universe/system_jumps/` — ~1 hr TTL
-- `GET /universe/system_kills/` — ~1 hr TTL
+- `GET /universe/system_jumps/` — rolling snapshot only on ESI; archive each poll to build jump activity history
+- `GET /universe/system_kills/` — same; archive each poll for historical kill activity
 - `POST /universe/names/` — batch ID→name, up to 1000 IDs
 - `POST /universe/ids/` — batch name→ID
 
@@ -72,29 +77,39 @@ Aggregated from scanning ~15 downstream projects:
 **Killmails**
 - `GET /killmails/{killmail_id}/{killmail_hash}/`
 
-**Sovereignty / Incursions / Industry**
-- `GET /sovereignty/map/`
-- `GET /sovereignty/structures/`
-- `GET /incursions/`
-- `GET /industry/facilities/`
-- `GET /status/`
+**Sovereignty / Incursions / Industry** (temporal — archive snapshots to track changes over time)
+- `GET /sovereignty/map/` — territorial control changes; archive each snapshot to track alliance history
+- `GET /sovereignty/structures/` — same
+- `GET /incursions/` — archive each poll; ESI only shows active incursions, archive builds historical record
+- `GET /industry/facilities/` — archive changes
+- `GET /status/` — not archived; proxy-only
 
 ## Architecture
 
-**Stack (matches downstream project ecosystem):** Python + FastAPI, Redis for cache storage, httpx for async upstream calls.
+**Stack (matches downstream project ecosystem):** Python + FastAPI, Redis (hot cache), PostgreSQL (persistent archive), httpx for async upstream calls.
 
-**Cache key scheme:** `esi:{method}:{path}:{sorted_query_string}` — e.g. `esi:GET:/v1/markets/10000002/orders/?order_type=all&page=1`. For merged paginated results use key without `page=` param.
+**Two-tier storage model:**
+- **Redis** — hot cache with TTL matching ESI `Cache-Control`. Evicts naturally. Serves repeated proxy requests without hitting ESI or the DB.
+- **PostgreSQL** — permanent archive. Data written here is never deleted. Time-series endpoints (markets, jumps, kills, sovereignty) get a timestamp column and append-only inserts. Reference data (universe types, systems, etc.) gets upserted.
+
+**Cache/archive key scheme:** `esi:{method}:{path}:{sorted_query_string}` — e.g. `esi:GET:/v1/markets/10000002/orders/?order_type=all`. For merged paginated results, omit `page=` from the key.
 
 **Request flow:**
 1. Incoming request → normalize path/query → check Redis key
-2. Cache hit with valid TTL → return immediately with `X-Cache: HIT`
-3. Stale/missing → fetch ESI with `If-None-Match` if ETag stored
-4. 304 → refresh TTL, return cached body; 200 → store body+ETag, set TTL from `Cache-Control`
-5. ESI 5xx → return stale cached data if available (`stale-if-error`)
+2. Redis hit with valid TTL → return immediately with `X-Cache: HIT`
+3. Redis miss → fetch ESI with `If-None-Match` if ETag stored
+4. ESI 304 → refresh Redis TTL, return cached body (no archive write needed)
+5. ESI 200 → write to Redis (with TTL) **and** write to PostgreSQL archive (with `fetched_at` timestamp)
+6. ESI 5xx → return stale Redis data if available; fall back to most recent archive row
 
-**Paginated endpoints:** Detect `X-Pages > 1` on first page response, fan out remaining pages concurrently with `asyncio.gather`, merge `items[]` arrays, cache merged result under the base key (no `page=` param). Return merged result to caller regardless of which page they requested.
+**Archive write strategy by endpoint type:**
+- **Time-series** (orders, prices, jumps, kills, sovereignty, incursions): append every new snapshot with `fetched_at`. Never overwrite.
+- **Reference/static** (universe types, systems, regions, corps, characters): upsert on primary key, store `first_seen_at` and `last_updated_at`.
+- **Event data** (killmails, contracts, contract items): insert-once by natural key (killmail_id+hash, contract_id). Immutable after first write.
 
-**POST endpoints** (`/universe/names/`, `/universe/ids/`, `/characters/affiliation/`): Cache individual ID lookups within the batch response so partial cache hits can avoid re-fetching known IDs.
+**Paginated endpoints:** Detect `X-Pages > 1` on first page response, fan out remaining pages concurrently with `asyncio.gather`, merge `items[]` arrays. Archive the merged result as a single snapshot. Return merged result to caller.
+
+**POST endpoints** (`/universe/names/`, `/universe/ids/`, `/characters/affiliation/`): Cache and archive individual ID→name mappings extracted from each batch response so future lookups for known IDs never hit ESI.
 
 ## Development Setup
 
@@ -113,6 +128,10 @@ pytest tests/test_markets.py::test_orders_cache_hit -v
 
 # Redis (required)
 redis-server --daemonize yes
+
+# PostgreSQL (required for archive layer)
+# Run migrations before starting the server
+alembic upgrade head
 ```
 
 ## Key ESI Gotchas
@@ -122,4 +141,5 @@ redis-server --daemonize yes
 - **`/characters/{character_id}/portrait/`** returns redirect URLs to image.eveonline.com CDN — cache the redirect target URL, not just the 302.
 - **Singularity** (test server) has different region/system IDs than Tranquility; never cross-pollute cache keys between datasources.
 - ESI rate limit is per **source IP**. If this proxy is shared across users, error budget is pooled — monitor `X-ESI-Error-Limit-Remain` aggressively.
-- Some endpoints (e.g. `/markets/prices/`) don't paginate but are large JSON blobs (~400KB) — store compressed in Redis.
+- Some endpoints (e.g. `/markets/prices/`) don't paginate but are large JSON blobs (~400KB) — store compressed in Redis and as JSONB in PostgreSQL.
+- **Never delete archive rows.** If a market order disappears from the live feed, it still exists in the archive as a historical record. Deletions only happen in Redis (via TTL expiry).

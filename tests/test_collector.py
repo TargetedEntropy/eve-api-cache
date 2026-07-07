@@ -204,6 +204,38 @@ async def test_discover_type_ids_extracts_from_payload():
 # Datasource param handling
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Error-budget breaker aborts bulk history collection (fix 1.5)
+# ---------------------------------------------------------------------------
+
+async def test_market_history_region_skips_when_budget_blocked(cache_client):
+    from app.collector import collect_market_history_for_region
+
+    esi = AsyncMock()
+    esi.is_budget_blocked = MagicMock(return_value=True)
+
+    result = await collect_market_history_for_region(10000002, esi, cache_client)
+
+    assert result == 0
+    esi.fetch.assert_not_called()  # no discovery, no fan-out
+
+
+async def test_market_history_region_runs_when_not_blocked(cache_client):
+    from app.collector import collect_market_history_for_region
+
+    esi = AsyncMock()
+    esi.is_budget_blocked = MagicMock(return_value=False)
+
+    # Not blocked → proceeds to discovery; empty archive yields 0 fetched.
+    with patch("app.collector.AsyncSessionLocal", _FakeSessionCM), patch(
+        "app.archive.get_latest_payload", new=AsyncMock(return_value=None)
+    ):
+        result = await collect_market_history_for_region(10000002, esi, cache_client)
+
+    assert result == 0
+    esi.fetch.assert_not_called()  # empty archive → nothing to fetch, but discovery ran
+
+
 async def test_singularity_datasource_sends_param_to_esi(cache_client, mock_esi):
     mock_esi.fetch.return_value = make_200(b"[]")
 

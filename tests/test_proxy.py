@@ -73,6 +73,31 @@ def make_esi_420(body: bytes = b'{"error":"error limit exceeded"}') -> ESIRespon
     )
 
 
+def make_esi_429(body: bytes = b'{"error":"too many requests"}') -> ESIResponse:
+    return ESIResponse(
+        status=429,
+        body=body,
+        etag=None,
+        max_age=None,
+        expires_at=None,
+        not_modified=False,
+        error_limit_remain=None,
+        error_limit_reset=None,
+    )
+
+
+def make_esi_302(location: str = "https://images.evetech.net/characters/95/portrait") -> ESIResponse:
+    return ESIResponse(
+        status=302,
+        body=b"",
+        etag=None,
+        max_age=None,
+        expires_at=None,
+        not_modified=False,
+        location=location,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Test 1: Cache HIT — ESI is never contacted
 # ---------------------------------------------------------------------------
@@ -439,6 +464,228 @@ async def test_archive_write_failure_does_not_fail_proxy_response(
     assert result.cache_status == "MISS"
     assert result.body == b'[{"order_id":1}]'
     mock_db.rollback.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# 3xx redirect pass-through, not followed / not archived (fix 2.2)
+# ---------------------------------------------------------------------------
+
+async def test_3xx_passed_through_with_location_not_archived(
+    cache_client: CacheClient, mock_db, test_settings: Settings
+):
+    mock_esi = AsyncMock()
+    mock_esi.fetch.return_value = make_esi_302()
+    mock_write = AsyncMock()
+
+    with patch("app.archive.write_snapshot", new=mock_write):
+        result = await proxy_request(
+            "/v1/characters/95/portrait/", "GET", {}, None,
+            cache_client, mock_esi, mock_db, test_settings,
+        )
+
+    assert result.status == 302
+    assert result.location == "https://images.evetech.net/characters/95/portrait"
+    assert result.cache_status == "MISS"
+    mock_write.assert_not_called()  # redirects are not archiveable observations
+
+    # The redirect is not written to the positive cache either.
+    key = build_cache_key("tranquility", "GET", "/v1/characters/95/portrait/", {}, None)
+    assert await cache_client._r.get(f"esi:body:{key}") is None
+
+
+# ---------------------------------------------------------------------------
+# Per-endpoint query-param allowlist (fix 4.2)
+# ---------------------------------------------------------------------------
+
+async def test_unknown_query_param_rejected_before_esi(
+    cache_client: CacheClient, mock_esi, mock_db, test_settings: Settings
+):
+    """Junk params are rejected before any cache/ESI/archive activity."""
+    result = await proxy_request(
+        "/v1/markets/10000002/orders/", "GET",
+        {"order_type": "all", "junk": "1"}, None,
+        cache_client, mock_esi, mock_db, test_settings,
+    )
+    assert result.status == 400
+    assert result.cache_status == "ERROR"
+    mock_esi.fetch.assert_not_called()
+
+
+async def test_rejected_param_creates_no_cache_key(
+    cache_client: CacheClient, mock_esi, mock_db, test_settings: Settings
+):
+    """A request killed by param validation must not touch Redis at all."""
+    await proxy_request(
+        "/v1/status/", "GET", {"evil": "1"}, None,
+        cache_client, mock_esi, mock_db, test_settings,
+    )
+    keys = [k async for k in cache_client._r.scan_iter("esi:*")]
+    assert keys == []
+    mock_esi.fetch.assert_not_called()
+
+
+async def test_history_missing_required_type_id_rejected(
+    cache_client: CacheClient, mock_esi, mock_db, test_settings: Settings
+):
+    """history 400s at ESI without type_id — reject before contacting ESI."""
+    result = await proxy_request(
+        "/v1/markets/10000002/history/", "GET", {}, None,
+        cache_client, mock_esi, mock_db, test_settings,
+    )
+    assert result.status == 400
+    assert result.cache_status == "ERROR"
+    mock_esi.fetch.assert_not_called()
+
+
+async def test_history_with_type_id_reaches_esi(
+    cache_client: CacheClient, mock_db, test_settings: Settings
+):
+    mock_esi = AsyncMock()
+    mock_esi.fetch.return_value = make_esi_200(b"[]")
+
+    with patch("app.archive.write_snapshot", new=AsyncMock()):
+        result = await proxy_request(
+            "/v1/markets/10000002/history/", "GET", {"type_id": "34"}, None,
+            cache_client, mock_esi, mock_db, test_settings,
+        )
+    assert result.status == 200
+    mock_esi.fetch.assert_called_once()
+
+
+async def test_allowed_language_param_forwarded_to_esi(
+    cache_client: CacheClient, mock_db, test_settings: Settings
+):
+    mock_esi = AsyncMock()
+    mock_esi.fetch.return_value = make_esi_200(b'{"type_id":34}')
+
+    with patch("app.archive.write_snapshot", new=AsyncMock()):
+        result = await proxy_request(
+            "/v1/universe/types/34/", "GET", {"language": "en"}, None,
+            cache_client, mock_esi, mock_db, test_settings,
+        )
+    assert result.status == 200
+    assert mock_esi.fetch.call_args.args[2].get("language") == "en"
+
+
+# ---------------------------------------------------------------------------
+# Negative caching of 4xx responses (fix 1.3)
+# ---------------------------------------------------------------------------
+
+async def test_4xx_is_negatively_cached(
+    cache_client: CacheClient, mock_db, test_settings: Settings
+):
+    """A 404 is cached briefly so a looping client stops hitting ESI (and its budget)."""
+    mock_esi = AsyncMock()
+    mock_esi.fetch.return_value = make_esi_404()
+
+    r1 = await proxy_request(
+        "/v1/universe/types/999999999/", "GET", {}, None,
+        cache_client, mock_esi, mock_db, test_settings,
+    )
+    assert r1.status == 404
+    assert r1.cache_status == "MISS"
+
+    # Second identical request is served from the negative cache, ESI untouched.
+    r2 = await proxy_request(
+        "/v1/universe/types/999999999/", "GET", {}, None,
+        cache_client, mock_esi, mock_db, test_settings,
+    )
+    assert r2.status == 404
+    assert r2.cache_status == "HIT"
+    assert r2.body == r1.body
+    mock_esi.fetch.assert_called_once()
+
+
+async def test_429_is_not_negatively_cached(
+    cache_client: CacheClient, mock_db, test_settings: Settings
+):
+    """429 is a transient throttle, not a stable answer — never negative-cached."""
+    mock_esi = AsyncMock()
+    mock_esi.fetch.return_value = make_esi_429()
+
+    for _ in range(2):
+        result = await proxy_request(
+            "/v1/universe/types/34/", "GET", {}, None,
+            cache_client, mock_esi, mock_db, test_settings,
+        )
+        assert result.status == 429
+        assert result.cache_status == "MISS"
+
+    assert mock_esi.fetch.call_count == 2  # re-fetched each time, not cached
+
+
+async def test_negative_cache_respects_esi_max_age(
+    cache_client: CacheClient, mock_db, test_settings: Settings
+):
+    """When ESI supplies Cache-Control on the 4xx, honour it over the local default."""
+    mock_esi = AsyncMock()
+    resp = make_esi_404()
+    resp.max_age = 300
+    mock_esi.fetch.return_value = resp
+
+    await proxy_request(
+        "/v1/universe/types/5/", "GET", {}, None,
+        cache_client, mock_esi, mock_db, test_settings,
+    )
+    key = build_cache_key("tranquility", "GET", "/v1/universe/types/5/", {}, None)
+    ttl = await cache_client._r.ttl(f"esi:neg:body:{key}")
+    assert 290 <= ttl <= 300
+
+
+async def test_negative_cache_defaults_ttl_without_cache_control(
+    cache_client: CacheClient, mock_db, test_settings: Settings
+):
+    settings = test_settings.model_copy(update={"negative_cache_ttl_seconds": 45})
+    mock_esi = AsyncMock()
+    mock_esi.fetch.return_value = make_esi_404()  # max_age is None
+
+    await proxy_request(
+        "/v1/universe/types/6/", "GET", {}, None,
+        cache_client, mock_esi, mock_db, settings,
+    )
+    key = build_cache_key("tranquility", "GET", "/v1/universe/types/6/", {}, None)
+    ttl = await cache_client._r.ttl(f"esi:neg:body:{key}")
+    assert 35 <= ttl <= 45
+
+
+# ---------------------------------------------------------------------------
+# 304 refetch is coalesced (fix 1.6)
+# ---------------------------------------------------------------------------
+
+async def test_304_refetch_goes_through_coalesce(
+    cache_client: CacheClient, mock_db, test_settings: Settings
+):
+    """When 304 arrives but the body is gone, the unconditional refetch is coalesced."""
+    import app.proxy as proxymod
+
+    key = build_cache_key("tranquility", "GET", "/v1/status/", {}, None)
+    # Only an ETag survives (no body, no stale) → conditional request returns 304,
+    # forcing the refetch branch.
+    await cache_client._r.set(f"esi:etag:{key}", '"e1"')
+
+    not_modified = ESIResponse(
+        status=304, body=b"", etag='"e1"', max_age=300,
+        expires_at=None, not_modified=True,
+    )
+    mock_esi = AsyncMock()
+    mock_esi.fetch.side_effect = [not_modified, make_esi_200(b'{"players":1}')]
+
+    seen_keys: list[str] = []
+    orig_coalesce = proxymod.coalesce
+
+    async def spy_coalesce(k, fn):
+        seen_keys.append(k)
+        return await orig_coalesce(k, fn)
+
+    with patch("app.proxy.coalesce", new=spy_coalesce):
+        result = await proxy_request(
+            "/v1/status/", "GET", {}, None,
+            cache_client, mock_esi, mock_db, test_settings,
+        )
+
+    assert result.status == 200
+    assert mock_esi.fetch.call_count == 2  # conditional 304 + unconditional refetch
+    assert any(k.endswith(":refetch") for k in seen_keys)
 
 
 async def test_large_payload_skips_stale_redis_copy(

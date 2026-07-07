@@ -93,6 +93,33 @@ async def test_name_custom_ttl(cache_client: CacheClient):
     assert 3590 <= ttl <= 3600
 
 
+async def test_negative_cache_round_trip(cache_client: CacheClient):
+    await cache_client.set_negative("negk", b'{"error":"not found"}', 404, ttl=60)
+    result = await cache_client.get_negative("negk")
+    assert result == (b'{"error":"not found"}', 404)
+
+
+async def test_get_negative_missing_returns_none(cache_client: CacheClient):
+    assert await cache_client.get_negative("absent") is None
+
+
+async def test_negative_cache_ttl_applied(cache_client: CacheClient):
+    await cache_client.set_negative("negttl", b"{}", 400, ttl=60)
+    body_ttl = await cache_client._r.ttl("esi:neg:body:negttl")
+    status_ttl = await cache_client._r.ttl("esi:neg:status:negttl")
+    assert 50 <= body_ttl <= 60
+    assert 50 <= status_ttl <= 60
+
+
+async def test_positive_set_clears_negative_entry(cache_client: CacheClient):
+    """A later 200 for the same key must supersede a cached 4xx."""
+    await cache_client.set_negative("supk", b'{"error":"x"}', 404, ttl=60)
+    await cache_client.set("supk", b'{"ok":1}', ttl=300)
+    assert await cache_client.get_negative("supk") is None
+    got = await cache_client.get("supk")
+    assert got is not None and got[0] == b'{"ok":1}'
+
+
 async def test_get_returns_none_after_body_expires(cache_client: CacheClient):
     """
     Confirm that a zero-TTL set makes the body key immediately unavailable.

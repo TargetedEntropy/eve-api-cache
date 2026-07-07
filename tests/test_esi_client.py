@@ -290,3 +290,200 @@ async def test_max_age_parsed_from_expires_header(esi: ESIClient):
     # max_age should be approximately 120 (allow 5s tolerance for test timing)
     assert resp.max_age is not None
     assert 110 <= resp.max_age <= 125
+
+
+# ---------------------------------------------------------------------------
+# Error-budget circuit breaker (fix 1.1) + no-retry-on-420 (fix 1.2)
+# ---------------------------------------------------------------------------
+
+async def test_420_not_retried_and_trips_breaker(test_settings: Settings):
+    """420 is returned on the first try (never retried) and blocks further calls."""
+    settings = test_settings.model_copy(
+        update={"esi_max_retries": 3, "esi_retry_base_delay": 0.0}
+    )
+    client = ESIClient(settings)
+    try:
+        with respx.mock:
+            route = respx.get("https://esi.evetech.net/v1/status/").mock(
+                return_value=httpx.Response(
+                    420,
+                    json={"error": "rate limited"},
+                    headers={
+                        "X-Esi-Error-Limit-Remain": "0",
+                        "X-Esi-Error-Limit-Reset": "30",
+                    },
+                )
+            )
+            resp1 = await client.fetch("/v1/status/")
+            assert resp1.status == 420
+            assert route.call_count == 1  # despite esi_max_retries=3
+
+            # Breaker is tripped: the next fetch is a synthetic 503, no upstream call.
+            assert client.is_budget_blocked() is True
+            resp2 = await client.fetch("/v1/status/")
+            assert resp2.status == 503
+            assert route.call_count == 1
+            assert client.budget_status()["blocked"] is True
+    finally:
+        await client.aclose()
+
+
+async def test_low_error_budget_trips_breaker_on_200(test_settings: Settings):
+    """A 200 whose remaining-error budget is at/below threshold still trips the breaker."""
+    settings = test_settings.model_copy(update={"esi_error_budget_threshold": 10})
+    client = ESIClient(settings)
+    try:
+        with respx.mock:
+            respx.get("https://esi.evetech.net/v1/status/").mock(
+                return_value=httpx.Response(
+                    200,
+                    json={"players": 1},
+                    headers={
+                        "X-Esi-Error-Limit-Remain": "5",
+                        "X-Esi-Error-Limit-Reset": "20",
+                    },
+                )
+            )
+            resp = await client.fetch("/v1/status/")
+            assert resp.status == 200          # this request succeeded
+            assert client.is_budget_blocked()  # but budget is now too low to continue
+
+        status = client.budget_status()
+        assert status["blocked"] is True
+        assert status["error_limit_remain"] == 5
+        assert status["block_remaining_seconds"] > 0
+    finally:
+        await client.aclose()
+
+
+async def test_503_is_retried_but_500_is_not(test_settings: Settings):
+    """502/503/504 remain retriable; 500 is returned directly (fix 1.2)."""
+    settings = test_settings.model_copy(
+        update={"esi_max_retries": 2, "esi_retry_base_delay": 0.0}
+    )
+
+    client = ESIClient(settings)
+    try:
+        calls = {"n": 0}
+
+        def handler(request):
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                return httpx.Response(503)
+            return httpx.Response(200, json={"ok": True})
+
+        with respx.mock:
+            respx.get("https://esi.evetech.net/v1/status/").mock(side_effect=handler)
+            resp = await client.fetch("/v1/status/")
+        assert resp.status == 200
+        assert calls["n"] == 3  # two 503 retries, then success
+    finally:
+        await client.aclose()
+
+    client2 = ESIClient(settings)
+    try:
+        with respx.mock:
+            route = respx.get("https://esi.evetech.net/v1/status/").mock(
+                return_value=httpx.Response(500, json={"error": "boom"})
+            )
+            resp = await client2.fetch("/v1/status/")
+        assert resp.status == 500
+        assert route.call_count == 1  # 500 not retried
+    finally:
+        await client2.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Outbound token-bucket pacer (fix 1.5)
+# ---------------------------------------------------------------------------
+
+async def test_pacer_delays_when_tokens_exhausted(test_settings: Settings):
+    import time as _time
+
+    settings = test_settings.model_copy(update={"esi_max_requests_per_second": 10.0})
+    client = ESIClient(settings)
+    try:
+        client._tokens = 0.0
+        client._rate_updated = _time.monotonic()
+        start = _time.monotonic()
+        await client._pace()
+        elapsed = _time.monotonic() - start
+        assert elapsed >= 0.08  # ~1/rate = 0.1s
+    finally:
+        await client.aclose()
+
+
+async def test_pacer_disabled_is_noop(test_settings: Settings):
+    import time as _time
+
+    client = ESIClient(test_settings)  # esi_max_requests_per_second=0.0
+    try:
+        client._tokens = 0.0
+        start = _time.monotonic()
+        await client._pace()
+        assert (_time.monotonic() - start) < 0.02
+    finally:
+        await client.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Multi-page ETag is not a whole-set validator (fix 2.1)
+# ---------------------------------------------------------------------------
+
+async def test_multipage_merged_response_drops_page1_etag(esi: ESIClient):
+    """A merged multi-page body must NOT carry page 1's ETag as a whole-set validator."""
+    with respx.mock:
+        respx.get(
+            "https://esi.evetech.net/v1/markets/10000002/orders/", params={"page": "2"}
+        ).mock(return_value=httpx.Response(200, json=[{"id": 2}], headers={"ETag": '"p2"'}))
+        respx.get("https://esi.evetech.net/v1/markets/10000002/orders/").mock(
+            return_value=httpx.Response(
+                200, json=[{"id": 1}],
+                headers={"Cache-Control": "max-age=300", "X-Pages": "2", "ETag": '"p1"'},
+            )
+        )
+        resp = await esi.fetch("/v1/markets/10000002/orders/")
+
+    assert resp.status == 200
+    assert resp.page_count == 2
+    assert resp.etag is None  # no faked whole-set validator
+    # per-page ETags remain available for future per-page revalidation
+    etags = {m.get("etag") for m in resp.page_metadata}
+    assert '"p1"' in etags and '"p2"' in etags
+
+
+async def test_single_page_response_keeps_its_etag(esi: ESIClient):
+    with respx.mock:
+        respx.get("https://esi.evetech.net/v1/markets/10000002/orders/").mock(
+            return_value=httpx.Response(
+                200, json=[{"id": 1}],
+                headers={"Cache-Control": "max-age=300", "X-Pages": "1", "ETag": '"single"'},
+            )
+        )
+        resp = await esi.fetch("/v1/markets/10000002/orders/")
+
+    assert resp.status == 200
+    assert resp.etag == '"single"'  # single-page revalidation still works
+
+
+# ---------------------------------------------------------------------------
+# Redirects are not followed (fix 2.2)
+# ---------------------------------------------------------------------------
+
+async def test_redirect_not_followed_returns_location(esi: ESIClient):
+    """A 302 is passed through with its Location; the redirect target is never fetched."""
+    with respx.mock:
+        cdn = respx.get("https://images.evetech.net/characters/95/portrait").mock(
+            return_value=httpx.Response(200, content=b"\x89PNG\r\n\x1a\n")
+        )
+        portrait = respx.get("https://esi.evetech.net/v1/characters/95/portrait/").mock(
+            return_value=httpx.Response(
+                302, headers={"Location": "https://images.evetech.net/characters/95/portrait"}
+            )
+        )
+        resp = await esi.fetch("/v1/characters/95/portrait/")
+
+    assert resp.status == 302
+    assert resp.location == "https://images.evetech.net/characters/95/portrait"
+    assert portrait.call_count == 1
+    assert cdn.call_count == 0  # upstream redirect target must NOT be fetched

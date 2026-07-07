@@ -11,6 +11,7 @@ All writes are idempotent: duplicate retries produce no extra rows.
 """
 import json
 import hashlib
+import logging
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,6 +40,29 @@ _STORAGE_COMPRESSED_JSON = "compressed_json"
 _STORAGE_MARKET_PARQUET_DELTA = "market_parquet_delta"
 _DELTA_INSERT_BATCH_SIZE = 1000
 
+logger = logging.getLogger(__name__)
+
+# Cached pyarrow availability. Market-order Parquet archives are optional: when
+# pyarrow is absent we fall back to compressed-JSON storage (the payload is always
+# preserved in the blob table) instead of failing the whole archive write.
+_PYARROW_AVAILABLE: Optional[bool] = None
+
+
+def _pyarrow_available() -> bool:
+    global _PYARROW_AVAILABLE
+    if _PYARROW_AVAILABLE is None:
+        try:
+            import pyarrow.parquet  # noqa: F401
+
+            _PYARROW_AVAILABLE = True
+        except ImportError:
+            _PYARROW_AVAILABLE = False
+            logger.warning(
+                "pyarrow not installed; market-order snapshots fall back to "
+                "compressed-JSON storage"
+            )
+    return _PYARROW_AVAILABLE
+
 
 async def write_snapshot(
     session: AsyncSession,
@@ -64,11 +88,10 @@ async def write_snapshot(
             datasource, path, query_hash, content_hash, now
         )
         is_market_orders = _market_orders_region_id(path) is not None
-        payload_storage = (
-            _STORAGE_MARKET_PARQUET_DELTA
-            if is_market_orders and settings.enable_market_order_parquet
-            else _STORAGE_COMPRESSED_JSON
-        )
+        # Always insert as compressed_json — the payload is preserved in the blob
+        # table above. Only relabel to market_parquet_delta once the Parquet
+        # manifest actually exists (below); otherwise a failed or skipped Parquet
+        # write leaves the row permanently claiming a manifest it doesn't have (2.6).
         stmt = pg_insert(TimeSeriesSnapshot).values(
             datasource=datasource,
             path=path,
@@ -76,7 +99,7 @@ async def write_snapshot(
             content_hash=content_hash,
             idempotency_key=idempotency_key,
             payload=None,
-            payload_storage=payload_storage,
+            payload_storage=_STORAGE_COMPRESSED_JSON,
             fetched_at=now,
             esi_expires_at=expires_at,
             etag=etag,
@@ -89,7 +112,10 @@ async def write_snapshot(
         if snapshot_id is None:
             snapshot_id = await _get_timeseries_id_by_idempotency_key(session, idempotency_key)
 
-        if snapshot_id and is_market_orders and settings.enable_market_order_parquet:
+        # Parquet is an optional analytical store; skip it (staying compressed_json)
+        # when pyarrow is unavailable rather than failing the whole archive write.
+        want_parquet = is_market_orders and settings.enable_market_order_parquet
+        if snapshot_id and want_parquet and _pyarrow_available():
             manifest_id = await _write_market_orders_parquet(
                 session=session,
                 snapshot_id=snapshot_id,
@@ -100,14 +126,15 @@ async def write_snapshot(
                 payload=payload,
                 fetched_at=now,
             )
-            await session.execute(
-                update(TimeSeriesSnapshot)
-                .where(TimeSeriesSnapshot.id == snapshot_id)
-                .values(
-                    parquet_manifest_id=manifest_id,
-                    payload_storage=_STORAGE_MARKET_PARQUET_DELTA,
+            if manifest_id is not None:
+                await session.execute(
+                    update(TimeSeriesSnapshot)
+                    .where(TimeSeriesSnapshot.id == snapshot_id)
+                    .values(
+                        parquet_manifest_id=manifest_id,
+                        payload_storage=_STORAGE_MARKET_PARQUET_DELTA,
+                    )
                 )
-            )
 
     elif archive_type == ArchiveType.REFERENCE:
         payload_json = json.loads(payload)
@@ -327,7 +354,7 @@ async def _write_market_orders_parquet(
     content_hash: str,
     payload: bytes,
     fetched_at: datetime,
-) -> int:
+) -> Optional[int]:
     region_id = _market_orders_region_id(path)
     if region_id is None:
         raise ValueError(f"not a market-orders path: {path}")
@@ -338,7 +365,7 @@ async def _write_market_orders_parquet(
 
     existing_manifest_id = await _get_object_file_id_by_content_hash(session, content_hash)
     if existing_manifest_id is not None:
-        manifest_id = existing_manifest_id
+        manifest_id: Optional[int] = existing_manifest_id
     else:
         relative_path, stored_size = _write_market_orders_parquet_file(
             datasource=datasource,
@@ -362,9 +389,18 @@ async def _write_market_orders_parquet(
             "row_count": len(orders),
             ArchiveObjectFile.__table__.c.metadata: metadata,
             "created_at": fetched_at,
-        }).returning(ArchiveObjectFile.id)
+        }).on_conflict_do_nothing(
+            index_elements=["content_hash"]
+        ).returning(ArchiveObjectFile.id)
         result = await session.execute(stmt)
-        manifest_id = result.scalar_one()
+        manifest_id = result.scalar_one_or_none()
+        if manifest_id is None:
+            # Lost the race with a concurrent writer that inserted the same
+            # content_hash first. Reuse its manifest instead of raising a
+            # UniqueViolation that would roll back the entire snapshot and orphan
+            # the Parquet file just written (2.5). The file is deterministic by
+            # content_hash, so the concurrent write produced identical bytes.
+            manifest_id = await _get_object_file_id_by_content_hash(session, content_hash)
 
     if settings.enable_market_order_deltas:
         await _write_market_order_deltas(

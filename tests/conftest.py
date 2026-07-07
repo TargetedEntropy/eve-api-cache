@@ -19,6 +19,7 @@ def test_settings() -> Settings:
         esi_retry_base_delay=0.0,
         page_concurrency=3,
         upstream_concurrency=5,
+        esi_max_requests_per_second=0.0,  # disable pacer by default; paced tests opt in
         default_datasource="tranquility",
     )
 

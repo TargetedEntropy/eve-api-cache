@@ -9,6 +9,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from enum import Enum
+from functools import lru_cache
 from typing import Optional
 
 
@@ -22,6 +23,12 @@ class ArchiveType(str, Enum):
 VALID_VERSIONS = frozenset({"v1", "v2", "v3", "v4", "v5", "v6", "latest", "legacy", "dev"})
 VALID_DATASOURCES = frozenset({"tranquility", "singularity"})
 
+# Proxy-managed params: always allowed, never counted against an endpoint's
+# allow-set (page is paginated internally; datasource selects the namespace).
+_PROXY_PARAMS = frozenset({"page", "datasource"})
+# Localization param supported by ESI universe reference endpoints (bounded enum).
+_LANGUAGE = frozenset({"language"})
+
 
 @dataclass
 class EndpointSpec:
@@ -29,27 +36,34 @@ class EndpointSpec:
     methods: frozenset
     archive_type: ArchiveType
     extract_names: bool = False  # extract ID→name pairs from response (POST batch endpoints)
+    # Caller-supplied query params this endpoint accepts (besides _PROXY_PARAMS).
+    # Anything else is rejected before cache/ESI/archive so junk params can't
+    # create unbounded cache keys or permanent archive rows.
+    allowed_params: frozenset = frozenset()
+    required_params: frozenset = frozenset()  # ESI 400s without these; reject early
 
 
 # All public ESI endpoints we proxy. Pattern matches the path WITHOUT the version prefix.
 # Patterns must not match paths containing "..", encoded traversal, or other injection.
 _ENDPOINTS: list[EndpointSpec] = [
     # Markets
-    EndpointSpec(re.compile(r"^/markets/\d+/orders/?$"), frozenset({"GET"}), ArchiveType.TIME_SERIES),
-    EndpointSpec(re.compile(r"^/markets/\d+/history/?$"), frozenset({"GET"}), ArchiveType.TIME_SERIES),
+    EndpointSpec(re.compile(r"^/markets/\d+/orders/?$"), frozenset({"GET"}), ArchiveType.TIME_SERIES,
+                 allowed_params=frozenset({"order_type", "type_id"})),
+    EndpointSpec(re.compile(r"^/markets/\d+/history/?$"), frozenset({"GET"}), ArchiveType.TIME_SERIES,
+                 allowed_params=frozenset({"type_id"}), required_params=frozenset({"type_id"})),
     EndpointSpec(re.compile(r"^/markets/prices/?$"), frozenset({"GET"}), ArchiveType.TIME_SERIES),
-    # Universe — reference data
-    EndpointSpec(re.compile(r"^/universe/types/\d+/?$"), frozenset({"GET"}), ArchiveType.REFERENCE),
+    # Universe — reference data (localizable via ?language=)
+    EndpointSpec(re.compile(r"^/universe/types/\d+/?$"), frozenset({"GET"}), ArchiveType.REFERENCE, allowed_params=_LANGUAGE),
     EndpointSpec(re.compile(r"^/universe/systems/?$"), frozenset({"GET"}), ArchiveType.REFERENCE),
-    EndpointSpec(re.compile(r"^/universe/systems/\d+/?$"), frozenset({"GET"}), ArchiveType.REFERENCE),
+    EndpointSpec(re.compile(r"^/universe/systems/\d+/?$"), frozenset({"GET"}), ArchiveType.REFERENCE, allowed_params=_LANGUAGE),
     EndpointSpec(re.compile(r"^/universe/regions/?$"), frozenset({"GET"}), ArchiveType.REFERENCE),
-    EndpointSpec(re.compile(r"^/universe/regions/\d+/?$"), frozenset({"GET"}), ArchiveType.REFERENCE),
-    EndpointSpec(re.compile(r"^/universe/constellations/\d+/?$"), frozenset({"GET"}), ArchiveType.REFERENCE),
+    EndpointSpec(re.compile(r"^/universe/regions/\d+/?$"), frozenset({"GET"}), ArchiveType.REFERENCE, allowed_params=_LANGUAGE),
+    EndpointSpec(re.compile(r"^/universe/constellations/\d+/?$"), frozenset({"GET"}), ArchiveType.REFERENCE, allowed_params=_LANGUAGE),
     EndpointSpec(re.compile(r"^/universe/stations/\d+/?$"), frozenset({"GET"}), ArchiveType.REFERENCE),
     EndpointSpec(re.compile(r"^/universe/planets/\d+/?$"), frozenset({"GET"}), ArchiveType.REFERENCE),
     EndpointSpec(re.compile(r"^/universe/stars/\d+/?$"), frozenset({"GET"}), ArchiveType.REFERENCE),
-    EndpointSpec(re.compile(r"^/universe/factions/?$"), frozenset({"GET"}), ArchiveType.REFERENCE),
-    EndpointSpec(re.compile(r"^/universe/groups/\d+/?$"), frozenset({"GET"}), ArchiveType.REFERENCE),
+    EndpointSpec(re.compile(r"^/universe/factions/?$"), frozenset({"GET"}), ArchiveType.REFERENCE, allowed_params=_LANGUAGE),
+    EndpointSpec(re.compile(r"^/universe/groups/\d+/?$"), frozenset({"GET"}), ArchiveType.REFERENCE, allowed_params=_LANGUAGE),
     # Universe — time-series snapshots
     EndpointSpec(re.compile(r"^/universe/system_jumps/?$"), frozenset({"GET"}), ArchiveType.TIME_SERIES),
     EndpointSpec(re.compile(r"^/universe/system_kills/?$"), frozenset({"GET"}), ArchiveType.TIME_SERIES),
@@ -117,6 +131,44 @@ def match_endpoint(unversioned_path: str, method: str) -> Optional[EndpointSpec]
     for spec in _ENDPOINTS:
         if spec.pattern.match(unversioned_path) and method in spec.methods:
             return spec
+    return None
+
+
+@lru_cache(maxsize=512)
+def _pattern_to_label(pattern_str: str) -> str:
+    label = pattern_str
+    if label.startswith("^"):
+        label = label[1:]
+    if label.endswith("$"):
+        label = label[:-1]
+    label = label.replace("/?", "/")
+    label = re.sub(r"\\d\+", "{id}", label)
+    label = re.sub(r"\[0-9a-f\]\{40\}", "{hash}", label)
+    return label
+
+
+def endpoint_label(spec: EndpointSpec) -> str:
+    """Stable, low-cardinality label for a matched endpoint (a path template,
+    e.g. '/markets/{id}/orders/') — safe to use as a metrics label."""
+    return _pattern_to_label(spec.pattern.pattern)
+
+
+def check_params(spec: EndpointSpec, params: dict) -> Optional[str]:
+    """
+    Validate caller query params against the endpoint's allow/require sets.
+
+    Returns an error message if the request carries params the endpoint doesn't
+    support or omits a required one, else None. Runs before any cache/ESI/archive
+    activity so junk params can't bloat cache keys or the permanent archive, and
+    invalid requests never reach ESI. `page`/`datasource` are always allowed.
+    """
+    supplied = set(params) - _PROXY_PARAMS
+    unknown = supplied - spec.allowed_params
+    if unknown:
+        return "unsupported query parameter(s): " + ", ".join(sorted(unknown))
+    missing = spec.required_params - set(params)
+    if missing:
+        return "missing required query parameter(s): " + ", ".join(sorted(missing))
     return None
 
 

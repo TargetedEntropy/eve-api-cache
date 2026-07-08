@@ -2,9 +2,11 @@
 Redis hot-cache layer.
 
 Key layout:
-  esi:body:{cache_key}   → raw ESI response bytes (with TTL)
-  esi:stale:{cache_key}  → stale response bytes (TTL + stale window)
-  esi:etag:{cache_key}   → ETag string (same TTL + 60s buffer)
+  esi:body:{cache_key}        → raw ESI response bytes (with TTL)
+  esi:stale:{cache_key}       → stale response bytes (TTL + stale window)
+  esi:etag:{cache_key}        → ETag string (same TTL + 60s buffer)
+  esi:neg:body:{cache_key}    → cached 4xx body (short TTL — negative cache)
+  esi:neg:status:{cache_key}  → cached 4xx status code (same TTL)
   esi:name:{datasource}:{entity_id} → JSON {"name": str, "category": str} (24h TTL)
 """
 import json
@@ -51,7 +53,34 @@ class CacheClient:
             pipe.set(f"esi:etag:{key}", etag, ex=ttl + 60)
         else:
             pipe.delete(f"esi:etag:{key}")
+        # A fresh success supersedes any negative-cache entry for this key.
+        pipe.delete(f"esi:neg:body:{key}")
+        pipe.delete(f"esi:neg:status:{key}")
         await pipe.execute()
+
+    async def set_negative(self, key: str, body: bytes, status: int, ttl: int) -> None:
+        """
+        Briefly cache a 4xx response so a client looping on a known-bad request
+        (nonexistent ID, malformed params) doesn't burn one ESI error per call.
+        Never stores a stale copy or ETag — errors are not revalidated.
+        """
+        pipe = self._r.pipeline()
+        pipe.set(f"esi:neg:body:{key}", body, ex=ttl)
+        pipe.set(f"esi:neg:status:{key}", str(status), ex=ttl)
+        await pipe.execute()
+
+    async def get_negative(self, key: str) -> Optional[tuple[bytes, int]]:
+        """Return (body, status) for a cached 4xx, or None if not negatively cached."""
+        pipe = self._r.pipeline()
+        pipe.get(f"esi:neg:body:{key}")
+        pipe.get(f"esi:neg:status:{key}")
+        body, status = await pipe.execute()
+        if body is None or status is None:
+            return None
+        try:
+            return body, int(status)
+        except (TypeError, ValueError):
+            return None
 
     async def refresh_ttl(self, key: str, ttl: int) -> None:
         """Extend TTL on body (and etag if present) without changing the value."""
@@ -82,6 +111,20 @@ class CacheClient:
         """Cache an individual ID→name mapping."""
         value = json.dumps({"name": name, "category": category})
         await self._r.set(f"esi:name:{datasource}:{entity_id}", value, ex=ttl)
+
+    async def set_names(self, datasource: str, items, ttl: int = 86400) -> None:
+        """Bulk-cache ID→name mappings in a single Redis pipeline.
+
+        `items` is an iterable of (entity_id, name, category) tuples.
+        """
+        items = list(items)
+        if not items:
+            return
+        pipe = self._r.pipeline()
+        for entity_id, name, category in items:
+            value = json.dumps({"name": name, "category": category})
+            pipe.set(f"esi:name:{datasource}:{entity_id}", value, ex=ttl)
+        await pipe.execute()
 
 
 async def create_cache_client(settings: Settings) -> CacheClient:

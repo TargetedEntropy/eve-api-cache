@@ -122,6 +122,13 @@ async def collect_market_history_for_region(
     Run this less frequently than collect_market_orders (daily is fine; ESI
     history only updates once per day).
     """
+    if esi.is_budget_blocked():
+        logger.warning(
+            "Collector: ESI error budget blocked — skipping market history for region %s",
+            region_id,
+        )
+        return 0
+
     type_ids = await _discover_type_ids(region_id, datasource)
     if not type_ids:
         logger.debug("Collector: no type IDs found in archive for region %s — skipping history", region_id)

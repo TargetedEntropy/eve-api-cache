@@ -2,12 +2,19 @@
 APScheduler setup for background data collection.
 
 Jobs are fire-and-forget async coroutines running on the FastAPI event loop.
-Market-order jobs are jittered so N regions don't all hammer ESI simultaneously.
+Each job is given an explicit near-future, per-job `start_date` so that:
+  - its first run happens shortly after boot, not one full interval later
+    (a service restarted more often than the interval would otherwise never
+    run its daily jobs); and
+  - jobs within a group are phase-shifted so they don't all hit ESI at the
+    same instant. A small random jitter decorrelates steady-state runs too.
 """
 import logging
 import hashlib
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED, EVENT_JOB_MISSED
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy import text
@@ -17,33 +24,83 @@ from app.cache import CacheClient
 from app.config import Settings
 from app.db import AsyncSessionLocal
 from app.esi_client import ESIClient
+from app.metrics import metrics
 
 logger = logging.getLogger(__name__)
 
 
+def _record_job_event(event) -> None:
+    """APScheduler listener → collector_job_runs_total{job,result} + log gaps.
+
+    Missed/errored runs are logged so archive gaps (e.g. a Forge snapshot that
+    overran its interval) are visible, not silent.
+    """
+    if event.code == EVENT_JOB_ERROR:
+        result = "error"
+        logger.error(
+            "Collector job %s errored", event.job_id,
+            exc_info=getattr(event, "exception", None),
+        )
+    elif event.code == EVENT_JOB_MISSED:
+        result = "missed"
+        logger.warning("Collector job %s missed its scheduled run", event.job_id)
+    else:
+        result = "success"
+    metrics.inc_counter(
+        "collector_job_runs_total", job=event.job_id, result=result,
+        help="Collector job runs by job and result",
+    )
+
+# First-run / stagger offsets, in seconds after process start. STARTUP_DELAY
+# exceeds JITTER so a job's first fire never lands before "now" once jitter is
+# applied. History starts after the first orders snapshot has had a chance to
+# archive, since history discovery reads type IDs from that snapshot.
+_STARTUP_DELAY_SECONDS = 15
+_JITTER_SECONDS = 10
+_PRICES_START_SECONDS = 20
+_UNIVERSE_START_SECONDS = 30
+_UNIVERSE_STAGGER_SECONDS = 60
+_HISTORY_START_SECONDS = 120
+_HISTORY_STAGGER_SECONDS = 600
+
+
+def _first_run(offset_seconds: float) -> datetime:
+    """A near-future start_date `offset_seconds` after now (UTC)."""
+    return datetime.now(timezone.utc) + timedelta(seconds=offset_seconds)
+
+
 def create_scheduler(esi: ESIClient, cache: CacheClient, settings: Settings) -> AsyncIOScheduler:
     scheduler = AsyncIOScheduler(timezone="UTC")
+    scheduler.add_listener(
+        _record_job_event, EVENT_JOB_EXECUTED | EVENT_JOB_ERROR | EVENT_JOB_MISSED
+    )
     ds = settings.default_datasource
 
-    # --- Market orders: one job per region, jittered across the poll window ---
-    n_regions = len(settings.market_region_ids)
+    # --- Market orders: one job per region, phase-shifted across the poll window ---
+    n_regions = max(len(settings.market_region_ids), 1)
+    orders_step = settings.poll_market_orders_seconds / n_regions
     for i, region_id in enumerate(settings.market_region_ids):
-        # Spread start times evenly so regions don't all fire at once
-        jitter = int(settings.poll_market_orders_seconds / max(n_regions, 1) * i)
         scheduler.add_job(
             _run_singleton_job,
-            IntervalTrigger(seconds=settings.poll_market_orders_seconds),
+            IntervalTrigger(
+                seconds=settings.poll_market_orders_seconds,
+                start_date=_first_run(_STARTUP_DELAY_SECONDS + i * orders_step),
+                jitter=_JITTER_SECONDS,
+            ),
             args=[f"market_orders_{region_id}", collector.collect_market_orders, region_id, esi, cache, ds],
             id=f"market_orders_{region_id}",
             name=f"Market orders — region {region_id}",
             misfire_grace_time=60,
-            jitter=max(1, jitter),
         )
 
     # --- Market prices: global, once per poll window ---
     scheduler.add_job(
         _run_singleton_job,
-        IntervalTrigger(seconds=settings.poll_market_prices_seconds),
+        IntervalTrigger(
+            seconds=settings.poll_market_prices_seconds,
+            start_date=_first_run(_PRICES_START_SECONDS),
+            jitter=_JITTER_SECONDS,
+        ),
         args=["market_prices", collector.collect_market_prices, esi, cache, ds],
         id="market_prices",
         name="Market prices (global)",
@@ -51,10 +108,14 @@ def create_scheduler(esi: ESIClient, cache: CacheClient, settings: Settings) -> 
     )
 
     # --- Market history: daily per region (discovers type IDs from archived orders) ---
-    for region_id in settings.market_region_ids:
+    for i, region_id in enumerate(settings.market_region_ids):
         scheduler.add_job(
             _run_singleton_job,
-            IntervalTrigger(seconds=settings.poll_market_history_seconds),
+            IntervalTrigger(
+                seconds=settings.poll_market_history_seconds,
+                start_date=_first_run(_HISTORY_START_SECONDS + i * _HISTORY_STAGGER_SECONDS),
+                jitter=_JITTER_SECONDS,
+            ),
             args=[
                 f"market_history_{region_id}",
                 collector.collect_market_history_for_region,
@@ -77,10 +138,14 @@ def create_scheduler(esi: ESIClient, cache: CacheClient, settings: Settings) -> 
         ("incursions",                collector.collect_incursions,               "Incursions"),
         ("industry_facilities",       collector.collect_industry_facilities,      "Industry facilities"),
     ]
-    for job_id, fn, name in universe_jobs:
+    for i, (job_id, fn, name) in enumerate(universe_jobs):
         scheduler.add_job(
             _run_singleton_job,
-            IntervalTrigger(seconds=settings.poll_universe_seconds),
+            IntervalTrigger(
+                seconds=settings.poll_universe_seconds,
+                start_date=_first_run(_UNIVERSE_START_SECONDS + i * _UNIVERSE_STAGGER_SECONDS),
+                jitter=_JITTER_SECONDS,
+            ),
             args=[job_id, fn, esi, cache, ds],
             id=job_id,
             name=name,

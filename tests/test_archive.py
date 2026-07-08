@@ -1,5 +1,6 @@
 """PostgreSQL-backed tests for the archive write layer."""
 import hashlib
+import json
 import uuid
 
 import pytest
@@ -264,7 +265,9 @@ async def postgres_archive():
 @pytest.mark.postgres
 async def test_timeseries_write_is_idempotent_within_retry_bucket(postgres_archive):
     path = f"/v1/test/{uuid.uuid4()}/"
-    payload = b'[{"order_id":1}]'
+    # Large/repetitive enough to actually compress smaller — a tiny blob is
+    # dominated by codec framing overhead and ends up larger once compressed.
+    payload = json.dumps([{"order_id": n, "type_id": 34, "price": 12.3} for n in range(40)]).encode()
     content_hash = hashlib.sha256(payload).hexdigest()
 
     try:

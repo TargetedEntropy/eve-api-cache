@@ -1,3 +1,5 @@
+from typing import Optional
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -6,6 +8,10 @@ class Settings(BaseSettings):
 
     redis_url: str = "redis://localhost:6379/0"
     database_url: str = "postgresql+asyncpg://localhost/eve_cache"
+    # SQLAlchemy async pool sizing. Sized above collector job concurrency so the
+    # advisory-lock sessions + inner work can't starve proxy archive writes (3.3).
+    db_pool_size: int = 20
+    db_max_overflow: int = 10
     esi_base_url: str = "https://esi.evetech.net"
     user_agent: str = "eve-api-cache/0.1 (https://github.com/TargetedEntropy/eve-api-cache)"
     esi_timeout: float = 30.0
@@ -33,6 +39,21 @@ class Settings(BaseSettings):
     stale_cache_seconds: int = 3600
     stale_cache_max_body_bytes: int = 5_000_000
     negative_cache_ttl_seconds: int = 60       # how long to cache a 4xx (unless ESI Cache-Control says longer)
+    cache_compress_min_bytes: int = 65536      # zstd/zlib-compress Redis bodies at/above this size (5.2)
+
+    # Trusted reverse-proxy source IPs. When the direct peer is in this list, the
+    # first X-Forwarded-For hop is used for per-client rate limiting. Empty = use
+    # the direct peer (safe default; socat does NOT add XFF — see deploy notes) (4.3).
+    trusted_proxies: list[str] = []
+
+    # Optional shared token gating /metrics and /collector/status. None = open (4.5).
+    ops_api_token: Optional[str] = None
+
+    # Collector: extra version prefixes to also warm in Redis for the same body,
+    # so downstream apps calling e.g. /latest/... hit collector-warmed keys. The
+    # archive is still written once under the canonical /v1/ path (no identity
+    # merge). Empty = only warm the canonical path; document /v1/ for downstream (2.9).
+    collector_warm_alias_versions: list[str] = []
 
     # Per-client request cap. Kept well below ESI's shared ~100-errors/min budget:
     # the error-budget breaker (esi_error_budget_threshold) is the real protection,

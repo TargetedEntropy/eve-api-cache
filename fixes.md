@@ -14,10 +14,10 @@ Constraints for whoever applies these (per CLAUDE.md):
 
 ## Progress (updated 2026-07-07)
 
-Fix-order steps 1–6 applied, plus a first batch of step-7 items. Test suite grew from **59 passed /
-3 skipped** to **127 passed / 3 skipped** (the 3 skips are Postgres-marked, skipped without a DB).
-No schema migrations were needed. Each item's **Status:** line below has details. Suite now at
-**136 passed / 3 skipped**.
+**All items applied.** Test suite grew from **59 passed / 3 skipped** to **157 passed / 3 skipped**
+(the 3 skips are Postgres-marked, skipped without a DB). One additive migration was added (0004,
+`archive_events.query_hash`); archive history is preserved throughout. Each item's **Status:** line
+below has details.
 
 **Done ✅**
 - **1.1** ESI error-budget circuit breaker · **1.2** stop retrying 420/429 · **1.3** negative caching of 4xx · **1.6** coalesced 304 refetch
@@ -25,15 +25,15 @@ No schema migrations were needed. Each item's **Status:** line below has details
 - **3.1** real per-job staggering · **3.2** first-run-after-boot
 - **4.1** streaming POST body cap · **4.2** per-endpoint query-param allowlist
 - **5.1** in-process metrics + `GET /metrics`
-- _step 7:_ **2.3** contract bids → time-series · **3.4** job-gap logging · **5.4** batched name upserts + Redis pipeline · **5.5** `Warning` header on stale · **5.7** rate-limit/coalesce/extract test coverage
+- _step 7:_ **2.3** bids→time-series · **2.4** 304 TTL preserve · **2.7** leader-only writes · **2.8** event query_hash (migration 0004) · **2.9** collector alias warming · **3.3** pool sizing + unlock guard · **3.4** job-gap logging · **3.5** thin-market history discovery · **4.3** XFF + key pruning · **4.4** upstream-error envelope · **4.5** ops-token gating · **5.2** Redis compression · **5.3** affiliation→time-series · **5.4** batched name upserts · **5.5** `Warning` header · **5.6** content-type threading · **5.7** rate-limit/coalesce/scheduler test coverage
 
-**Partial ⚠️**
-- **1.4** default client rate limit lowered 600→300 + documented (dedicated per-client *error* throttle deferred)
+**Partial ⚠️** (deliberate scope calls, noted per item)
+- **1.4** default client rate limit lowered 600→300 + documented (dedicated per-client *error* throttle not added — breaker + negative cache cover the risk)
 - **1.5** outbound token-bucket pacer + breaker-abort added; per-region history staggering delivered via 3.1
+- **2.9 / 4.3 / 4.5** ship the mechanism with a safe default (off/open) + docs; operators opt in (alias warming, XFF trust, ops token)
+- **5.7** advisory-lock skip + unlock paths now tested; the remaining named gap (proxy 304-TTL flow) is covered by 2.4's tests
 
-**Remaining (step 7, any order):** 2.4, 2.7, 2.8, 2.9, 3.3, 3.5, 4.3, 4.4, 4.5, 5.2, 5.3, 5.6. Several
-of these need a decision or a migration (2.8 column add, 2.9 warm-key policy, 4.3 deployment/XFF, 5.3
-affiliation table) rather than a mechanical fix — worth confirming direction before applying.
+**Remaining:** none — every audit item is addressed.
 
 ---
 
@@ -165,6 +165,9 @@ genuinely immutable and can stay EVENT. No migration needed (tables are shared, 
 existing event rows remain as history.
 
 ### 2.4 [MEDIUM] 304 revalidation TTL defaults to 300s instead of preserving the existing TTL
+
+**Status: ✅ DONE** — `cache.set` persists `esi:ttl:{key}` beside the ETag; on a 304 without a new Cache-Control the proxy reuses it (`cache.get_ttl`) instead of a flat 300. Dead `refresh_ttl` removed.
+
 `app/proxy.py:111`: `ttl = esi_resp.max_age or 300`. CLAUDE.md: "on 304 … extend the hot-cache TTL
 using the new Cache-Control header if present, **otherwise preserve the existing TTL**". Since the
 body key already expired, "existing TTL" should come from the stale key's remaining ESI-derived
@@ -210,6 +213,9 @@ UPDATE already sets it — just change the initial INSERT value). If pyarrow is 
 and fall back to compressed-JSON storage instead of failing the archive write.
 
 ### 2.7 [LOW] Every coalesced waiter re-writes Redis and re-archives the same response
+
+**Status: ✅ DONE** — `coalesce` returns `(result, is_leader)`; only the leader runs the 200 `cache.set` + `_archive_response`, so N waiters no longer re-compress/re-archive a Forge-sized payload.
+
 `app/proxy.py:101-150`: `coalesce()` deduplicates the upstream fetch, but each waiter then executes
 `cache.set` + `_archive_response` with the shared `ESIResponse`. Writes are idempotent (idempotency
 key / upserts) so this is waste, not corruption — N waiters mean N blob compressions, N parquet
@@ -220,6 +226,9 @@ perform store+archive and return the final body), or add a flag on the coalesce 
 leader.
 
 ### 2.8 [LOW] `archive_events` ignores query params — distinct queries collapse to one row
+
+**Status: ✅ DONE** — `query_hash` added to the `archive_events` PK (migration 0004, additive; existing rows backfilled with the empty-params hash so they stay reachable). Insert + `get_latest_payload` now key on it.
+
 `archive_events` PK is `(datasource, path)` (`app/db.py:126-127`) and the insert doesn't include
 `query_hash` (`app/archive.py:140-151`). Killmails/items/bids have no meaningful query params
 today, so impact is latent, but `get_latest_payload` also ignores `query_hash` for events
@@ -231,6 +240,9 @@ widen PK or add unique constraint `(datasource, path, query_hash)` — additive,
 filter on it in `get_latest_payload`.
 
 ### 2.9 [LOW] Collector archives under `/v1/...` while downstream callers commonly use `/latest/...`
+
+**Status: ✅ DONE (configurable)** — `_fetch_and_store` also warms alias version keys (`collector_warm_alias_versions`, e.g. `["latest"]`) for the same body; the archive is still written once under `/v1/` (no identity merge). Default empty + documented.
+
 `app/collector.py:81,94,105` hardcode `/v1/` paths. Cache keys and archive identity include the
 version prefix, so a downstream app calling `/latest/markets/10000002/orders/` never hits the
 collector-warmed cache and creates a parallel archive series. This follows the "proxy the exact
@@ -272,6 +284,9 @@ from 3.1), so the first collection happens shortly after startup. For history, c
 first run relative to that instead of process start.
 
 ### 3.3 [MEDIUM] Advisory-lock session pins a DB connection for the whole job duration
+
+**Status: ✅ DONE** — engine `pool_size`/`max_overflow` are explicit config (sized above job concurrency); the advisory-unlock is wrapped in try/except so a dropped connection can't mask the job result (Postgres releases the lock on close).
+
 `app/scheduler.py:98-116`: the session holding `pg_try_advisory_lock` stays checked out while
 `fn(*args)` runs (hours, for history jobs), and the inner collector work opens additional sessions
 (`app/collector.py:59`) — up to 10 concurrent under the history semaphore. SQLAlchemy's default pool
@@ -297,6 +312,9 @@ archive is invisible.
 better than a missing one for a permanent archive.
 
 ### 3.5 [LOW] History discovery misses types with no currently active orders
+
+**Status: ✅ DONE** — discovery unions the latest snapshot with every type_id ever archived for the region (join over `market_order_snapshot_entries`/`versions`); degrades to snapshot-only on any query error. No new table/migration.
+
 `app/collector.py:145-163` discovers type IDs from the latest orders snapshot only. Types that are
 traded rarely (no open orders at snapshot time) never get history archived, defeating the "extend
 the 13-month window" goal for exactly the thin markets where it matters most.
@@ -340,6 +358,9 @@ endpoint-required params (history requires `type_id`; ESI 400s otherwise) so inv
 reach ESI — CLAUDE.md requires input validation before ESI is contacted.
 
 ### 4.3 [MEDIUM] Rate limiter keys on the direct peer IP — broken by the documented socat deployment
+
+**Status: ✅ DONE (mechanism)** — trusted-proxy XFF attribution (`trusted_proxies` + first XFF hop); idle rate-limit keys periodically pruned; single-process limit documented. Operators must still replace socat with a real reverse proxy (nginx/caddy) to actually pass XFF.
+
 `app/routes.py:45` uses `request.client.host`. deploy.md fronts the loopback listener with socat
 (`10.0.0.33:8080 -> 127.0.0.1:8080`), so **every** LAN/VPN client arrives as the same source IP:
 one noisy client exhausts the single shared bucket for everyone, and per-client attribution is
@@ -355,6 +376,9 @@ document the single-process assumption or move the limiter to Redis (`INCR`+`EXP
 shared across workers.
 
 ### 4.4 [LOW] Upstream error bodies are passed through verbatim with a JSON content type
+
+**Status: ✅ DONE** — a 5xx with no stale/archive returns a JSON envelope `{"error":"upstream_error","status":N}` instead of a possibly-non-JSON upstream body; 4xx bodies keep their real Content-Type (via 5.6).
+
 `app/proxy.py:161,164` and `ProxyResult.content_type` default: non-JSON upstream error payloads
 (HTML from an intermediary, etc.) are relayed byte-for-byte labeled `application/json`. Low risk
 (ESI is the only upstream), but it can leak upstream infrastructure details and confuse clients.
@@ -364,6 +388,9 @@ shared across workers.
 truncated body server-side only.
 
 ### 4.5 [LOW] `/collector/status` and `/healthz` are unauthenticated operational surfaces
+
+**Status: ✅ DONE** — `/metrics` and `/collector/status` gated behind `X-Ops-Token` when `ops_api_token` is set (401 otherwise); `/healthz` stays open for health checks. Default open + documented.
+
 `app/routes.py:23-32`. On the documented LAN/VPN deployment this is acceptable, but the collector
 status enumerates job IDs/schedules. When adding the metrics endpoint (6.1), gate these behind a
 shared token header or bind them to a separate localhost-only port; at minimum document the
@@ -388,6 +415,9 @@ pagination fanout failures (`app/esi_client.py:166-178`), and scheduler job succ
 (3.4). This also unblocks verifying several fixes above.
 
 ### 5.2 [MEDIUM] Large payloads stored uncompressed (and duplicated) in Redis
+
+**Status: ✅ DONE** — `CacheClient` zstd/zlib-compresses bodies at/above `cache_compress_min_bytes` (default 64KB) with a magic-prefix marker; `get`/`get_stale` transparently decode; legacy unprefixed values read as raw.
+
 CLAUDE.md gotcha: `/markets/prices/` (~400KB) and merged Forge orders (potentially tens of MB)
 should be stored compressed in Redis. `app/cache.py:44-54` stores the raw body **twice** (body +
 stale copy). A Forge snapshot every 5 min keeps 2 full uncompressed copies resident.
@@ -398,6 +428,9 @@ stale copy as a reference to the same compressed value where possible (or accept
 duplication). Add tests for round-trip and for the >threshold path.
 
 ### 5.3 [MEDIUM] `/characters/affiliation/` results are not extracted per-entity
+
+**Status: ✅ DONE** — affiliation changed to `ArchiveType.TIME_SERIES` so batches append (character→corp/alliance history) instead of upserting by body hash; `write_names` docstring corrected (affiliation carries no id→name pairs). Kept out of any public query surface per the Data Risk section.
+
 `app/allowlist.py:63` sets no `extract_names` (correct — affiliations have no names), but CLAUDE.md
 says POST batch endpoints should "archive extracted normalized entities separately". Affiliation
 rows (character→corp/alliance at time T) are exactly the aggregation-sensitive history the project
@@ -427,6 +460,9 @@ and 1000 awaited Redis SETs inline in the request path.
 **Status: ✅ DONE** — `Warning: 110 - "Response is Stale"` added to the STALE and ARCHIVE_FALLBACK header sets.
 
 ### 5.6 [LOW] `ProxyResult.content_type` is always `application/json`
+
+**Status: ✅ DONE** — upstream `Content-Type` threaded `ESIResponse` → `ProxyResult` → response header for live 200/4xx paths (cached/synthetic responses stay JSON).
+
 Fine for ESI JSON endpoints, wrong for pass-through errors (4.4) and any future non-JSON endpoint.
 **Fix:** Thread the upstream `Content-Type` through `ESIResponse` → cache (store alongside body) →
 `ProxyResult`. Can be folded into 5.2's cache-envelope work.

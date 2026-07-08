@@ -224,6 +224,18 @@ async def test_write_names_batches_db_and_redis():
     assert session.commits == 1
 
 
+async def test_event_write_includes_query_hash():
+    """EVENT inserts carry query_hash so params-bearing endpoints don't collapse (2.8)."""
+    session = _RecordingSession()
+    await write_snapshot(
+        session, "tranquility", "/v1/killmails/1/" + "a" * 40 + "/", "qh123", "c" * 64,
+        b'{"killmail_id":1}', 200, None, None, ArchiveType.EVENT,
+    )
+    inserts = _dml_for(session.statements, PGInsert, "archive_events")
+    assert len(inserts) == 1
+    assert _params(inserts[0])["query_hash"] == "qh123"
+
+
 def test_extract_name_mappings_forms_and_edges():
     extract = archive._extract_name_mappings
     # list form (/universe/names/)

@@ -84,3 +84,7 @@ def test_contract_bids_are_time_series():
 
 def test_contract_items_stay_event():
     assert _spec("/contracts/public/items/123/").archive_type == ArchiveType.EVENT
+
+
+def test_affiliation_is_time_series():
+    assert _spec("/characters/affiliation/", "POST").archive_type == ArchiveType.TIME_SERIES

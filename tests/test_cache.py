@@ -6,7 +6,7 @@ Tests cover all public methods plus the internal key layout
 """
 import pytest
 
-from app.cache import CacheClient
+from app.cache import CacheClient, _CACHE_MAGIC
 
 
 async def test_set_and_get_returns_body_and_etag(cache_client: CacheClient):
@@ -48,17 +48,6 @@ async def test_set_without_etag_does_not_write_etag_key(cache_client: CacheClien
     await cache_client.set("noetag", b"body", ttl=300)
     raw = await cache_client._r.get("esi:etag:noetag")
     assert raw is None
-
-
-async def test_refresh_ttl_extends_expiry(cache_client: CacheClient):
-    await cache_client.set("refreshkey", b"v", ttl=100, etag='"e1"')
-    # Extend to 600
-    await cache_client.refresh_ttl("refreshkey", 600)
-    body_ttl = await cache_client._r.ttl("esi:body:refreshkey")
-    etag_ttl = await cache_client._r.ttl("esi:etag:refreshkey")
-    # TTLs should reflect the new value (fakeredis gives exact values)
-    assert body_ttl > 100
-    assert etag_ttl > 100
 
 
 async def test_name_round_trip(cache_client: CacheClient):
@@ -104,6 +93,43 @@ async def test_set_names_bulk_round_trip(cache_client: CacheClient):
 async def test_set_names_empty_is_noop(cache_client: CacheClient):
     await cache_client.set_names("tranquility", [])
     assert await cache_client.get_name("tranquility", 999) is None
+
+
+# --- Preserved TTL for 304 revalidation (fix 2.4) ---
+
+async def test_ttl_stored_with_etag(cache_client: CacheClient):
+    await cache_client.set("k", b"body", ttl=1234, etag='"e"')
+    assert await cache_client.get_ttl("k") == 1234
+
+
+async def test_ttl_absent_without_etag(cache_client: CacheClient):
+    await cache_client.set("k2", b"body", ttl=100)  # no etag → no ttl key
+    assert await cache_client.get_ttl("k2") is None
+
+
+# --- Compression of large payloads (fix 5.2) ---
+
+async def test_large_body_compressed_round_trip(fake_redis):
+    client = CacheClient(fake_redis, compress_min_bytes=100)
+    body = b'{"orders":[' + b'{"id":1,"price":12.34},' * 60 + b']}'  # repetitive, > 100 bytes
+    await client.set("big", body, ttl=300)
+
+    raw = await fake_redis.get("esi:body:big")
+    assert raw.startswith(_CACHE_MAGIC)   # stored compressed
+    assert len(raw) < len(body)
+    got = await client.get("big")
+    assert got is not None and got[0] == body           # decodes to original
+    assert await client.get_stale("big") == body        # stale copy also decodes
+
+
+async def test_small_body_not_compressed(fake_redis):
+    client = CacheClient(fake_redis, compress_min_bytes=1000)
+    body = b'{"small":1}'
+    await client.set("small", body, ttl=300)
+
+    raw = await fake_redis.get("esi:body:small")
+    assert raw == body and not raw.startswith(_CACHE_MAGIC)
+    assert (await client.get("small"))[0] == body
 
 
 async def test_negative_cache_round_trip(cache_client: CacheClient):

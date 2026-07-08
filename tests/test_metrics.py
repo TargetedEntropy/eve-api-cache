@@ -176,3 +176,21 @@ async def test_metrics_endpoint_serves_prometheus_text():
     assert resp.status_code == 200
     assert "text/plain" in resp.headers["content-type"]
     assert 'proxy_requests_total{cache_status="HIT",endpoint="/status/"} 1' in resp.text
+
+
+async def test_metrics_requires_ops_token_when_configured():
+    from app.config import Settings
+    from app.deps import get_settings
+
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        ops_api_token="secret", esi_max_requests_per_second=0.0
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        denied = await client.get("/metrics")
+        allowed = await client.get("/metrics", headers={"X-Ops-Token": "secret"})
+
+    assert denied.status_code == 401
+    assert allowed.status_code == 200

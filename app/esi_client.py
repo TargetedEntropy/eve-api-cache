@@ -73,6 +73,7 @@ class ESIResponse:
     page_count: int = 1
     page_metadata: list[dict] = field(default_factory=list)
     location: Optional[str] = None  # Location header on 3xx (redirects are not followed)
+    content_type: str = "application/json"  # upstream Content-Type (JSON for merged/synthetic)
 
 
 class ESIClient:
@@ -201,6 +202,7 @@ class ESIClient:
                 error_limit_reset=error_reset,
                 page_metadata=page_metadata,
                 location=resp.headers.get("location"),
+                content_type=resp.headers.get("content-type", "application/json"),
             )
 
         # Fan out additional pages if paginated
@@ -246,6 +248,7 @@ class ESIClient:
             error_limit_reset=error_reset,
             page_count=x_pages,
             page_metadata=page_metadata,
+            content_type=resp.headers.get("content-type", "application/json"),
         )
 
     async def _fetch_all_pages(

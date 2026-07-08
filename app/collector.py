@@ -15,6 +15,8 @@ import json
 import logging
 from typing import Optional
 
+from sqlalchemy import text
+
 from app.allowlist import ArchiveType, build_cache_key, compute_query_hash
 from app.archive import write_snapshot
 from app.cache import CacheClient
@@ -51,7 +53,17 @@ async def _fetch_and_store(
 
     cache_key = build_cache_key(datasource, method, path, params, body)
     ttl = resp.max_age or 300
-    await cache.set(cache_key, resp.body, ttl, resp.etag, _stale_ttl_for_payload(resp.body))
+    stale_ttl = _stale_ttl_for_payload(resp.body)
+    await cache.set(cache_key, resp.body, ttl, resp.etag, stale_ttl)
+
+    # Optionally warm the same body under alias version prefixes (e.g. /latest/) so
+    # downstream apps not calling /v1/ still hit collector-warmed keys. The archive
+    # is written once under the canonical path below — no archive identity merge.
+    for alias_version in settings.collector_warm_alias_versions:
+        alias_path = _swap_version(path, alias_version)
+        if alias_path != path:
+            alias_key = build_cache_key(datasource, method, alias_path, params, body)
+            await cache.set(alias_key, resp.body, ttl, resp.etag, stale_ttl)
 
     query_hash = compute_query_hash(params, body)
     content_hash = hashlib.sha256(resp.body).hexdigest()
@@ -150,24 +162,73 @@ async def collect_market_history_for_region(
 
 
 async def _discover_type_ids(region_id: int, datasource: str) -> list[int]:
-    """Return distinct type_ids from the most recent market-orders snapshot."""
+    """
+    Return the type_ids to fetch history for: the most recent orders snapshot
+    unioned with every type_id ever archived for the region, so thin markets
+    with no currently-open orders still get history archived (3.5).
+    """
     from app.archive import get_latest_payload
 
     path = f"/v1/markets/{region_id}/orders/"
     query_hash = compute_query_hash({"order_type": "all"}, None)
+    type_ids: set[int] = set()
 
     async with AsyncSessionLocal() as session:
         raw_payload = await get_latest_payload(session, datasource, path, query_hash)
+        if raw_payload is not None:
+            try:
+                payload = json.loads(raw_payload)
+                type_ids.update(
+                    int(o["type_id"]) for o in payload
+                    if isinstance(o, dict) and "type_id" in o
+                )
+            except (TypeError, ValueError):
+                pass
+        type_ids.update(await _accumulated_type_ids(session, datasource, region_id))
 
-    if raw_payload is None:
-        return []
+    return list(type_ids)
 
+
+async def _accumulated_type_ids(session, datasource: str, region_id: int) -> set[int]:
+    """
+    Distinct type_ids across all archived market-order versions for a region
+    (requires enable_market_order_deltas). Any error degrades to an empty set so
+    discovery still works from the latest snapshot alone.
+    """
     try:
-        payload = json.loads(raw_payload)
-    except (TypeError, ValueError):
-        return []
+        result = await session.execute(
+            text(
+                "SELECT DISTINCT (v.payload ->> 'type_id') AS type_id "
+                "FROM market_order_snapshot_entries e "
+                "JOIN market_order_versions v "
+                "  ON v.datasource = :ds AND v.order_id = e.order_id "
+                "  AND v.version_hash = e.version_hash "
+                "WHERE e.region_id = :region"
+            ),
+            {"ds": datasource, "region": region_id},
+        )
+        rows = list(result.all())
+    except Exception:
+        return set()
 
-    return list({int(o["type_id"]) for o in payload if isinstance(o, dict) and "type_id" in o})
+    ids: set[int] = set()
+    for row in rows:
+        raw = row[0]
+        if raw is None:
+            continue
+        try:
+            ids.add(int(raw))
+        except (TypeError, ValueError):
+            continue
+    return ids
+
+
+def _swap_version(path: str, version: str) -> str:
+    """Replace the leading version segment: '/v1/x/y' → '/{version}/x/y'."""
+    parts = path.split("/", 2)  # ["", "v1", "x/y"]
+    if len(parts) < 3:
+        return path
+    return f"/{version}/{parts[2]}"
 
 
 def _stale_ttl_for_payload(body: bytes) -> int:

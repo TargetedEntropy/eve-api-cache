@@ -152,20 +152,25 @@ async def _dispatch(
     async def do_fetch():
         return await esi.fetch(full_path, method, esi_params, body, stored_etag)
 
-    esi_resp = await coalesce(cache_key, do_fetch)
+    esi_resp, is_leader = await coalesce(cache_key, do_fetch)
 
     # --- 7. 304 Not Modified ---
     if esi_resp.not_modified:
         stale_body = await cache.get_stale(cache_key)
         if stale_body is not None:
-            ttl = esi_resp.max_age or 300
-            await cache.set(
-                cache_key,
-                stale_body,
-                ttl,
-                esi_resp.etag or stored_etag,
-                _stale_ttl_for_payload(stale_body, settings),
-            )
+            # Extend the hot-cache TTL using the new Cache-Control, otherwise
+            # preserve the prior TTL (CLAUDE.md) rather than a flat 300.
+            ttl = esi_resp.max_age
+            if ttl is None:
+                ttl = await cache.get_ttl(cache_key) or 300
+            if is_leader:
+                await cache.set(
+                    cache_key,
+                    stale_body,
+                    ttl,
+                    esi_resp.etag or stored_etag,
+                    _stale_ttl_for_payload(stale_body, settings),
+                )
             return ProxyResult(200, stale_body, "MISS")
 
         # Body was evicted from Redis and no stale copy remains, so re-fetch without
@@ -176,33 +181,36 @@ async def _dispatch(
         async def do_refetch():
             return await esi.fetch(full_path, method, esi_params, body, None)
 
-        esi_resp = await coalesce(f"{cache_key}:refetch", do_refetch)
+        esi_resp, is_leader = await coalesce(f"{cache_key}:refetch", do_refetch)
 
     # --- 8. ESI 200 ---
     if esi_resp.status == 200:
-        ttl = esi_resp.max_age or 300
-        await cache.set(
-            cache_key,
-            esi_resp.body,
-            ttl,
-            esi_resp.etag,
-            _stale_ttl_for_payload(esi_resp.body, settings),
-        )
+        # Only the coalesce leader writes: waiters share the body and would just
+        # re-run the same idempotent Redis/blob/parquet/delta writes (2.7).
+        if is_leader:
+            ttl = esi_resp.max_age or 300
+            await cache.set(
+                cache_key,
+                esi_resp.body,
+                ttl,
+                esi_resp.etag,
+                _stale_ttl_for_payload(esi_resp.body, settings),
+            )
 
-        await _archive_response(
-            db=db,
-            cache=cache,
-            datasource=datasource,
-            full_path=full_path,
-            query_hash=query_hash,
-            body=esi_resp.body,
-            etag=esi_resp.etag,
-            expires_at=esi_resp.expires_at,
-            archive_type=spec.archive_type,
-            extract_names=spec.extract_names,
-        )
+            await _archive_response(
+                db=db,
+                cache=cache,
+                datasource=datasource,
+                full_path=full_path,
+                query_hash=query_hash,
+                body=esi_resp.body,
+                etag=esi_resp.etag,
+                expires_at=esi_resp.expires_at,
+                archive_type=spec.archive_type,
+                extract_names=spec.extract_names,
+            )
 
-        return ProxyResult(200, esi_resp.body, "MISS")
+        return ProxyResult(200, esi_resp.body, "MISS", content_type=esi_resp.content_type)
 
     # --- 9. ESI degraded mode: stale/archive fallback ---
     if esi_resp.status == 420 or esi_resp.status >= 500:
@@ -213,7 +221,10 @@ async def _dispatch(
         archive_body = await archive.get_latest_payload(db, datasource, full_path, query_hash)
         if archive_body:
             return ProxyResult(200, archive_body, "ARCHIVE_FALLBACK")
-        return ProxyResult(esi_resp.status, esi_resp.body, "ERROR")
+        # Don't relay a raw upstream 5xx body (may be non-JSON HTML from an
+        # intermediary, mislabeled as JSON and leaking infra details) — 4.4.
+        envelope = json.dumps({"error": "upstream_error", "status": esi_resp.status}).encode()
+        return ProxyResult(esi_resp.status, envelope, "ERROR")
 
     # --- 9b. 3xx: pass the redirect through with its Location; never followed ---
     # ESI portrait/image endpoints 30x to a CDN. We hand the redirect back to the
@@ -234,7 +245,7 @@ async def _dispatch(
         )
         if neg_ttl > 0:
             await cache.set_negative(cache_key, esi_resp.body, esi_resp.status, neg_ttl)
-    return ProxyResult(esi_resp.status, esi_resp.body, "MISS")
+    return ProxyResult(esi_resp.status, esi_resp.body, "MISS", content_type=esi_resp.content_type)
 
 
 def _validate_post_body(body: Optional[bytes], max_items: int) -> Optional[bytes]:

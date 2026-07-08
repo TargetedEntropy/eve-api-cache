@@ -174,11 +174,19 @@ async def _run_singleton_job(job_id: str, fn, *args):
         try:
             return await fn(*args)
         finally:
-            await session.execute(
-                text("SELECT pg_advisory_unlock(:lock_id)"),
-                {"lock_id": lock_id},
-            )
-            await session.commit()
+            # The connection may have died mid-job; don't let unlock failure mask
+            # the job result. PostgreSQL releases advisory locks on connection close.
+            try:
+                await session.execute(
+                    text("SELECT pg_advisory_unlock(:lock_id)"),
+                    {"lock_id": lock_id},
+                )
+                await session.commit()
+            except Exception:
+                logger.warning(
+                    "advisory unlock failed for %s; lock releases on connection close",
+                    job_id, exc_info=True,
+                )
 
 
 def _advisory_lock_id(job_id: str) -> int:

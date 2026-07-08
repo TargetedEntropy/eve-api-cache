@@ -51,6 +51,11 @@ class _FakeSessionCM:
     """Async context manager that yields a mock AsyncSession without DB access."""
     def __init__(self):
         self.session = AsyncMock()
+        # _accumulated_type_ids does `result = await session.execute(...); result.all()`.
+        # Return a sync result with an empty row set so no unawaited coroutine leaks.
+        exec_result = MagicMock()
+        exec_result.all.return_value = []
+        self.session.execute.return_value = exec_result
 
     async def __aenter__(self):
         return self.session
@@ -265,6 +270,71 @@ async def test_tranquility_datasource_omits_param_from_esi(cache_client, mock_es
 
     esi_params = mock_esi.fetch.call_args.kwargs.get("params") or {}
     assert "datasource" not in esi_params
+
+
+async def test_collector_warms_alias_version_keys(cache_client, mock_esi, monkeypatch):
+    """With collector_warm_alias_versions=['latest'], the body is warmed under
+    both /v1/ and /latest/ keys (2.9)."""
+    from app.allowlist import build_cache_key
+    import app.collector as collector_mod
+
+    monkeypatch.setattr(collector_mod.settings, "collector_warm_alias_versions", ["latest"])
+    mock_esi.fetch.return_value = make_200(b"[]")
+
+    with no_db_ctx():
+        await collect_market_orders(10000002, mock_esi, cache_client)
+
+    v1_key = build_cache_key("tranquility", "GET", "/v1/markets/10000002/orders/", {"order_type": "all"}, None)
+    latest_key = build_cache_key("tranquility", "GET", "/latest/markets/10000002/orders/", {"order_type": "all"}, None)
+    assert await cache_client.get(v1_key) is not None
+    assert await cache_client.get(latest_key) is not None
+
+
+async def test_collector_no_alias_by_default(cache_client, mock_esi):
+    """Default (no aliases) warms only the canonical key."""
+    from app.allowlist import build_cache_key
+    mock_esi.fetch.return_value = make_200(b"[]")
+
+    with no_db_ctx():
+        await collect_market_orders(10000002, mock_esi, cache_client)
+
+    latest_key = build_cache_key("tranquility", "GET", "/latest/markets/10000002/orders/", {"order_type": "all"}, None)
+    assert await cache_client.get(latest_key) is None
+
+
+def test_swap_version():
+    from app.collector import _swap_version
+    assert _swap_version("/v1/markets/10000002/orders/", "latest") == "/latest/markets/10000002/orders/"
+    assert _swap_version("/v1/universe/types/34/", "legacy") == "/legacy/universe/types/34/"
+
+
+async def test_accumulated_type_ids_unions_into_discovery():
+    """History discovery includes type_ids from accumulated versions, not just the
+    latest snapshot (3.5)."""
+    from unittest.mock import MagicMock
+    from app.collector import _discover_type_ids
+
+    cm = _FakeSessionCM()
+    # Accumulated query returns two type_ids (as text, like ->> yields).
+    acc_result = MagicMock()
+    acc_result.all.return_value = [("34",), ("9999",)]
+    cm.session.execute.return_value = acc_result
+
+    # Latest snapshot contributes type_id 34 (overlaps) and 35.
+    snapshot = [{"order_id": 1, "type_id": 34}, {"order_id": 2, "type_id": 35}]
+    with patch("app.collector.AsyncSessionLocal", lambda: cm), patch(
+        "app.archive.get_latest_payload", new=AsyncMock(return_value=json.dumps(snapshot).encode())
+    ):
+        result = await _discover_type_ids(10000002, "tranquility")
+
+    assert set(result) == {34, 35, 9999}  # 9999 only exists in accumulated history
+
+
+async def test_accumulated_type_ids_degrades_on_error():
+    from app.collector import _accumulated_type_ids
+    session = AsyncMock()
+    session.execute.side_effect = RuntimeError("db down")
+    assert await _accumulated_type_ids(session, "tranquility", 10000002) == set()
 
 
 async def test_tranquility_cache_key_excludes_datasource_param(cache_client, mock_esi):

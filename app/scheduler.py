@@ -30,11 +30,20 @@ logger = logging.getLogger(__name__)
 
 
 def _record_job_event(event) -> None:
-    """APScheduler listener → collector_job_runs_total{job,result}."""
+    """APScheduler listener → collector_job_runs_total{job,result} + log gaps.
+
+    Missed/errored runs are logged so archive gaps (e.g. a Forge snapshot that
+    overran its interval) are visible, not silent.
+    """
     if event.code == EVENT_JOB_ERROR:
         result = "error"
+        logger.error(
+            "Collector job %s errored", event.job_id,
+            exc_info=getattr(event, "exception", None),
+        )
     elif event.code == EVENT_JOB_MISSED:
         result = "missed"
+        logger.warning("Collector job %s missed its scheduled run", event.job_id)
     else:
         result = "success"
     metrics.inc_counter(

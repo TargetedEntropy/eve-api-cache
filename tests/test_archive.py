@@ -224,6 +224,20 @@ async def test_write_names_batches_db_and_redis():
     assert session.commits == 1
 
 
+def test_extract_name_mappings_forms_and_edges():
+    extract = archive._extract_name_mappings
+    # list form (/universe/names/)
+    assert extract([{"id": 5, "name": "X", "category": "character"}]) == [(5, "X", "character")]
+    # dict form (/universe/ids/): category key singularized
+    assert set(extract({"characters": [{"id": 1, "name": "A"}], "systems": [{"id": 2, "name": "B"}]})) == {
+        (1, "A", "character"), (2, "B", "system"),
+    }
+    # entries missing id/name are skipped; id=0 is falsy and filtered
+    assert extract([{"id": 0, "name": "Z"}, {"name": "noid"}, {"id": 9}]) == []
+    # non-list/dict payloads yield nothing
+    assert extract("nope") == []
+
+
 class _FakeNameCache:
     def __init__(self) -> None:
         self.names = {}

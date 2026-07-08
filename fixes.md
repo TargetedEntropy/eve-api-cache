@@ -16,7 +16,8 @@ Constraints for whoever applies these (per CLAUDE.md):
 
 Fix-order steps 1–6 applied, plus a first batch of step-7 items. Test suite grew from **59 passed /
 3 skipped** to **127 passed / 3 skipped** (the 3 skips are Postgres-marked, skipped without a DB).
-No schema migrations were needed. Each item's **Status:** line below has details.
+No schema migrations were needed. Each item's **Status:** line below has details. Suite now at
+**136 passed / 3 skipped**.
 
 **Done ✅**
 - **1.1** ESI error-budget circuit breaker · **1.2** stop retrying 420/429 · **1.3** negative caching of 4xx · **1.6** coalesced 304 refetch
@@ -24,13 +25,15 @@ No schema migrations were needed. Each item's **Status:** line below has details
 - **3.1** real per-job staggering · **3.2** first-run-after-boot
 - **4.1** streaming POST body cap · **4.2** per-endpoint query-param allowlist
 - **5.1** in-process metrics + `GET /metrics`
-- _step 7:_ **2.3** contract bids → time-series · **5.4** batched name upserts + Redis pipeline · **5.5** `Warning` header on stale
+- _step 7:_ **2.3** contract bids → time-series · **3.4** job-gap logging · **5.4** batched name upserts + Redis pipeline · **5.5** `Warning` header on stale · **5.7** rate-limit/coalesce/extract test coverage
 
 **Partial ⚠️**
 - **1.4** default client rate limit lowered 600→300 + documented (dedicated per-client *error* throttle deferred)
 - **1.5** outbound token-bucket pacer + breaker-abort added; per-region history staggering delivered via 3.1
 
-**Remaining (step 7, any order):** 2.4, 2.7, 2.8, 2.9, 3.3, 3.4, 3.5, 4.3, 4.4, 4.5, 5.2, 5.3, 5.6, 5.7.
+**Remaining (step 7, any order):** 2.4, 2.7, 2.8, 2.9, 3.3, 3.5, 4.3, 4.4, 4.5, 5.2, 5.3, 5.6. Several
+of these need a decision or a migration (2.8 column add, 2.9 warm-key policy, 4.3 deployment/XFF, 5.3
+affiliation table) rather than a mechanical fix — worth confirming direction before applying.
 
 ---
 
@@ -282,6 +285,8 @@ the connection died mid-job — wrap the unlock in try/except and rely on connec
 the lock.
 
 ### 3.4 [LOW] `misfire_grace_time=60` + slow Forge fetch can silently skip order snapshots
+**Status: ✅ DONE** — `_record_job_event` exports `collector_job_runs_total{result="missed"|"error"}` (via 5.1) and now logs missed/errored runs so archive gaps are visible. `misfire_grace_time` kept as-is (conservative); `=None` ("run late rather than skip" for time-series jobs) noted as a future option.
+
 A Forge order snapshot (300+ pages with retries) can exceed 300s; with `max_instances=1` (default)
 and `misfire_grace_time=60` (`app/scheduler.py:39`), the next run is skipped and the gap in the
 archive is invisible.
@@ -427,6 +432,8 @@ Fine for ESI JSON endpoints, wrong for pass-through errors (4.4) and any future 
 `ProxyResult`. Can be folded into 5.2's cache-envelope work.
 
 ### 5.7 [LOW] Test coverage gaps for existing behavior
+**Status: ⚠️ MOSTLY** — `rate_limit.py` (limit=0, per-key isolation, window eviction), `coalesce.py` (shared execution, leader-failure propagation, key release, distinct keys), and `_extract_name_mappings` edge cases now have tests; routes body-size landed with 4.1. Residual: proxy 304-TTL flow (tied to 2.4) and the scheduler advisory-lock skip path (needs a DB).
+
 No tests exist for: `app/rate_limit.py` (window edges, limit=0), `app/coalesce.py` (leader failure
 propagation, concurrent waiters, cancellation), proxy 304 flows (TTL handling — will be needed for
 2.4), routes-level body-size enforcement (needed for 4.1), scheduler advisory-lock skip path

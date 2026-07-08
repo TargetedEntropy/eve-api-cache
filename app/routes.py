@@ -14,11 +14,12 @@ from app.scheduler import scheduler_status
 
 router = APIRouter()
 
+_WARNING_STALE = '110 - "Response is Stale"'
 _CACHE_STATUS_HEADERS = {
     "HIT": {"X-Cache": "HIT"},
     "MISS": {"X-Cache": "MISS"},
-    "STALE": {"X-Cache": "STALE"},
-    "ARCHIVE_FALLBACK": {"X-Cache": "STALE", "X-Archive-Fallback": "true"},
+    "STALE": {"X-Cache": "STALE", "Warning": _WARNING_STALE},
+    "ARCHIVE_FALLBACK": {"X-Cache": "STALE", "X-Archive-Fallback": "true", "Warning": _WARNING_STALE},
     "ERROR": {"X-Cache": "ERROR"},
 }
 

@@ -14,9 +14,9 @@ Constraints for whoever applies these (per CLAUDE.md):
 
 ## Progress (updated 2026-07-07)
 
-Fix-order steps 1–6 applied. Test suite grew from **59 passed / 3 skipped** to **121 passed / 3
-skipped** (the 3 skips are Postgres-marked, skipped without a DB). No schema migrations were needed.
-Each item's **Status:** line below has details.
+Fix-order steps 1–6 applied, plus a first batch of step-7 items. Test suite grew from **59 passed /
+3 skipped** to **127 passed / 3 skipped** (the 3 skips are Postgres-marked, skipped without a DB).
+No schema migrations were needed. Each item's **Status:** line below has details.
 
 **Done ✅**
 - **1.1** ESI error-budget circuit breaker · **1.2** stop retrying 420/429 · **1.3** negative caching of 4xx · **1.6** coalesced 304 refetch
@@ -24,12 +24,13 @@ Each item's **Status:** line below has details.
 - **3.1** real per-job staggering · **3.2** first-run-after-boot
 - **4.1** streaming POST body cap · **4.2** per-endpoint query-param allowlist
 - **5.1** in-process metrics + `GET /metrics`
+- _step 7:_ **2.3** contract bids → time-series · **5.4** batched name upserts + Redis pipeline · **5.5** `Warning` header on stale
 
 **Partial ⚠️**
 - **1.4** default client rate limit lowered 600→300 + documented (dedicated per-client *error* throttle deferred)
 - **1.5** outbound token-bucket pacer + breaker-abort added; per-region history staggering delivered via 3.1
 
-**Remaining (step 7, any order):** 2.3, 2.4, 2.7, 2.8, 2.9, 3.3, 3.4, 3.5, 4.3, 4.4, 4.5, 5.2, 5.3, 5.4, 5.5, 5.6, 5.7.
+**Remaining (step 7, any order):** 2.4, 2.7, 2.8, 2.9, 3.3, 3.4, 3.5, 4.3, 4.4, 4.5, 5.2, 5.3, 5.6, 5.7.
 
 ---
 
@@ -149,6 +150,8 @@ Safety Requirements).
 target URL per the CLAUDE.md gotcha. Add a test that a 302 response is passed through, not followed.
 
 ### 2.3 [MEDIUM] Contract bids archived as insert-once EVENT although bids are mutable
+**Status: ✅ DONE** — bids changed to `ArchiveType.TIME_SERIES` (append each observation); items stay `EVENT`. No migration — the archive tables are shared and keyed by path, so existing event rows remain as history.
+
 `app/allowlist.py:75`: `/contracts/public/bids/{contract_id}/` is `ArchiveType.EVENT`, and
 `archive_events` is keyed on `(datasource, path)` with `on_conflict_do_nothing`
 (`app/archive.py:138-151`). The first observed bid list is frozen forever; all later bids on an
@@ -404,6 +407,8 @@ append instead of upserting by body-hash. Decide deliberately; note the Data Ris
 player-profiling-adjacent data — keep it out of any public query surface).
 
 ### 5.4 [MEDIUM] `write_names` does one round-trip per ID — up to 1000 sequential upserts + Redis SETs per request
+**Status: ✅ DONE** — `write_names` builds all rows and issues chunked multi-row `on_conflict_do_update` upserts plus a single `CacheClient.set_names` Redis pipeline, instead of 1000 awaited statements each.
+
 `app/archive.py:180-193`. A full-size `/universe/names/` batch performs 1000 awaited DB statements
 and 1000 awaited Redis SETs inline in the request path.
 
@@ -413,6 +418,8 @@ and 1000 awaited Redis SETs inline in the request path.
 ### 5.5 [LOW] Stale responses lack the `Warning` header CLAUDE.md/Proxy-safety rules mention
 `app/routes.py:14-20` sets `X-Cache: STALE` / `X-Archive-Fallback: true` but no `Warning: 110 - "response is stale"`.
 **Fix:** Add the header to the STALE and ARCHIVE_FALLBACK header sets.
+
+**Status: ✅ DONE** — `Warning: 110 - "Response is Stale"` added to the STALE and ARCHIVE_FALLBACK header sets.
 
 ### 5.6 [LOW] `ProxyResult.content_type` is always `application/json`
 Fine for ESI JSON endpoints, wrong for pass-through errors (4.4) and any future non-JSON endpoint.

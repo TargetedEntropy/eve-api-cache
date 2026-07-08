@@ -204,21 +204,37 @@ async def write_names(
     if not mappings:
         return
 
-    for entity_id, name, category in mappings:
-        await cache.set_name(datasource, entity_id, name, category or "unknown")
-        stmt = pg_insert(IdNameCache).values(
-            datasource=datasource,
-            entity_id=entity_id,
-            entity_name=name,
-            category=category,
-            first_seen_at=now,
-            last_updated_at=now,
-        ).on_conflict_do_update(
-            index_elements=["datasource", "entity_id"],
-            set_=dict(entity_name=name, category=category, last_updated_at=now),
+    # Batch the DB upserts and Redis writes: a full /universe/names/ batch is up
+    # to 1000 IDs, which as one-at-a-time awaited statements is 1000 round-trips
+    # each to PostgreSQL and Redis inline in the request path.
+    rows = [
+        {
+            "datasource": datasource,
+            "entity_id": entity_id,
+            "entity_name": name,
+            "category": category,
+            "first_seen_at": now,
+            "last_updated_at": now,
+        }
+        for entity_id, name, category in mappings
+    ]
+    for batch in _chunks(rows, _DELTA_INSERT_BATCH_SIZE):
+        insert_stmt = pg_insert(IdNameCache).values(batch)
+        await session.execute(
+            insert_stmt.on_conflict_do_update(
+                index_elements=["datasource", "entity_id"],
+                set_=dict(
+                    entity_name=insert_stmt.excluded.entity_name,
+                    category=insert_stmt.excluded.category,
+                    last_updated_at=insert_stmt.excluded.last_updated_at,
+                ),
+            )
         )
-        await session.execute(stmt)
 
+    await cache.set_names(
+        datasource,
+        [(entity_id, name, category or "unknown") for entity_id, name, category in mappings],
+    )
     await session.commit()
 
 

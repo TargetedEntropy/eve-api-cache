@@ -195,6 +195,35 @@ def test_pyarrow_available_caches(monkeypatch):
     assert archive._pyarrow_available() is first
 
 
+# ---------------------------------------------------------------------------
+# write_names batches DB upserts and Redis writes (fix 5.4)
+# ---------------------------------------------------------------------------
+
+async def test_write_names_batches_db_and_redis():
+    class _BulkCache:
+        def __init__(self):
+            self.calls = []
+
+        async def set_names(self, datasource, items, ttl=86400):
+            self.calls.append((datasource, list(items)))
+
+    cache = _BulkCache()
+    session = _RecordingSession()
+    payload = json.dumps(
+        [{"id": n, "name": f"name{n}", "category": "character"} for n in range(1, 6)]
+    ).encode()
+
+    await write_names(session, cache, "tranquility", payload)
+
+    # A single batched upsert into id_name_cache, not one statement per ID.
+    inserts = _dml_for(session.statements, PGInsert, "id_name_cache")
+    assert len(inserts) == 1
+    # A single bulk Redis call carrying all five mappings.
+    assert len(cache.calls) == 1
+    assert len(cache.calls[0][1]) == 5
+    assert session.commits == 1
+
+
 class _FakeNameCache:
     def __init__(self) -> None:
         self.names = {}
@@ -205,6 +234,10 @@ class _FakeNameCache:
             "category": category,
             "ttl": ttl,
         }
+
+    async def set_names(self, datasource: str, items, ttl: int = 86400) -> None:
+        for entity_id, name, category in items:
+            self.names[(datasource, entity_id)] = {"name": name, "category": category, "ttl": ttl}
 
 
 def test_payload_compression_round_trip():

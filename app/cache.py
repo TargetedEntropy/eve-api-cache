@@ -112,6 +112,20 @@ class CacheClient:
         value = json.dumps({"name": name, "category": category})
         await self._r.set(f"esi:name:{datasource}:{entity_id}", value, ex=ttl)
 
+    async def set_names(self, datasource: str, items, ttl: int = 86400) -> None:
+        """Bulk-cache ID→name mappings in a single Redis pipeline.
+
+        `items` is an iterable of (entity_id, name, category) tuples.
+        """
+        items = list(items)
+        if not items:
+            return
+        pipe = self._r.pipeline()
+        for entity_id, name, category in items:
+            value = json.dumps({"name": name, "category": category})
+            pipe.set(f"esi:name:{datasource}:{entity_id}", value, ex=ttl)
+        await pipe.execute()
+
 
 async def create_cache_client(settings: Settings) -> CacheClient:
     redis = Redis.from_url(settings.redis_url, decode_responses=False)

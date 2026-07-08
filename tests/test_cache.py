@@ -93,6 +93,19 @@ async def test_name_custom_ttl(cache_client: CacheClient):
     assert 3590 <= ttl <= 3600
 
 
+async def test_set_names_bulk_round_trip(cache_client: CacheClient):
+    await cache_client.set_names(
+        "tranquility", [(1, "Alpha", "character"), (2, "Beta", "corporation")]
+    )
+    assert await cache_client.get_name("tranquility", 1) == {"name": "Alpha", "category": "character"}
+    assert await cache_client.get_name("tranquility", 2) == {"name": "Beta", "category": "corporation"}
+
+
+async def test_set_names_empty_is_noop(cache_client: CacheClient):
+    await cache_client.set_names("tranquility", [])
+    assert await cache_client.get_name("tranquility", 999) is None
+
+
 async def test_negative_cache_round_trip(cache_client: CacheClient):
     await cache_client.set_negative("negk", b'{"error":"not found"}', 404, ttl=60)
     result = await cache_client.get_negative("negk")

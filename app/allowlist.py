@@ -85,8 +85,10 @@ _ENDPOINTS: list[EndpointSpec] = [
     EndpointSpec(re.compile(r"^/alliances/\d+/corporations/?$"), frozenset({"GET"}), ArchiveType.REFERENCE),
     # Contracts (public)
     EndpointSpec(re.compile(r"^/contracts/public/\d+/?$"), frozenset({"GET"}), ArchiveType.TIME_SERIES),
+    # Items are immutable once a contract exists; bids grow over an auction's life,
+    # so they must append (TIME_SERIES) rather than freeze the first observation.
     EndpointSpec(re.compile(r"^/contracts/public/items/\d+/?$"), frozenset({"GET"}), ArchiveType.EVENT),
-    EndpointSpec(re.compile(r"^/contracts/public/bids/\d+/?$"), frozenset({"GET"}), ArchiveType.EVENT),
+    EndpointSpec(re.compile(r"^/contracts/public/bids/\d+/?$"), frozenset({"GET"}), ArchiveType.TIME_SERIES),
     # Killmails (public — requires both ID and hash)
     EndpointSpec(re.compile(r"^/killmails/\d+/[0-9a-f]{40}/?$"), frozenset({"GET"}), ArchiveType.EVENT),
     # Sovereignty / Incursions / Industry

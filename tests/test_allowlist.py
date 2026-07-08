@@ -1,5 +1,5 @@
 """Unit tests for the per-endpoint query-param allowlist (fix 4.2)."""
-from app.allowlist import check_params, endpoint_label, match_endpoint
+from app.allowlist import ArchiveType, check_params, endpoint_label, match_endpoint
 
 
 def _spec(path: str, method: str = "GET"):
@@ -72,3 +72,15 @@ def test_endpoint_label_collapses_distinct_ids():
     a = endpoint_label(_spec("/markets/10000002/orders/"))
     b = endpoint_label(_spec("/markets/10000043/orders/"))
     assert a == b == "/markets/{id}/orders/"
+
+
+# ---------------------------------------------------------------------------
+# Contract bids are time-varying (fix 2.3)
+# ---------------------------------------------------------------------------
+
+def test_contract_bids_are_time_series():
+    assert _spec("/contracts/public/bids/123/").archive_type == ArchiveType.TIME_SERIES
+
+
+def test_contract_items_stay_event():
+    assert _spec("/contracts/public/items/123/").archive_type == ArchiveType.EVENT

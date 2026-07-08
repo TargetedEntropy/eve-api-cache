@@ -172,3 +172,18 @@ async def test_redirect_location_header_propagated(test_settings):
 
     assert resp.status_code == 302
     assert resp.headers.get("location") == "https://images.evetech.net/x"
+
+
+async def test_stale_response_carries_warning_header(test_settings):
+    """STALE / archive-fallback responses include a RFC 7234 Warning header (fix 5.5)."""
+    app = _build_app(test_settings)
+    stale = ProxyResult(200, b"[]", "STALE")
+
+    with patch("app.routes.proxy_request", new=AsyncMock(return_value=stale)):
+        async with _client(app) as client:
+            resp = await client.get(
+                "/v1/markets/10000002/orders/", params={"order_type": "all"}
+            )
+
+    assert resp.headers.get("x-cache") == "STALE"
+    assert resp.headers.get("warning", "").startswith("110")

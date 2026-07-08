@@ -94,3 +94,59 @@ async def test_single_region_does_not_break_stagger_math():
     order_jobs = [j for j in sched.get_jobs() if j.id.startswith("market_orders_")]
     assert len(order_jobs) == 1
     assert order_jobs[0].trigger.jitter == 10
+
+
+# ---------------------------------------------------------------------------
+# Advisory-lock singleton wrapper (fixes 3.3, 5.7)
+# ---------------------------------------------------------------------------
+
+class _LockSession:
+    def __init__(self, got_lock: bool, unlock_error: bool = False):
+        self._got_lock = got_lock
+        self._unlock_error = unlock_error
+
+    async def scalar(self, *args, **kwargs):
+        return self._got_lock
+
+    async def execute(self, *args, **kwargs):
+        if self._unlock_error:
+            raise RuntimeError("connection dropped")
+
+    async def commit(self):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+
+async def test_singleton_job_survives_unlock_failure(monkeypatch):
+    import app.scheduler as sched_mod
+    monkeypatch.setattr(sched_mod, "AsyncSessionLocal", lambda: _LockSession(True, unlock_error=True))
+
+    ran = {"done": False}
+
+    async def job():
+        ran["done"] = True
+        return "result"
+
+    result = await sched_mod._run_singleton_job("job_x", job)
+    assert result == "result"   # unlock failure must not mask the job result
+    assert ran["done"] is True
+
+
+async def test_singleton_job_skips_when_lock_held(monkeypatch):
+    import app.scheduler as sched_mod
+    monkeypatch.setattr(sched_mod, "AsyncSessionLocal", lambda: _LockSession(False))
+
+    ran = {"done": False}
+
+    async def job():
+        ran["done"] = True
+        return "result"
+
+    result = await sched_mod._run_singleton_job("job_y", job)
+    assert result is None        # another instance holds the lock → skip
+    assert ran["done"] is False

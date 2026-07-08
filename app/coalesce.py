@@ -14,10 +14,14 @@ _inflight: dict[str, asyncio.Future] = {}
 _lock = asyncio.Lock()
 
 
-async def coalesce(key: str, coro_fn: Callable[[], Awaitable[T]]) -> T:
+async def coalesce(key: str, coro_fn: Callable[[], Awaitable[T]]) -> tuple[T, bool]:
     """
     Execute coro_fn() for `key`, or wait for an in-flight execution to finish.
     All callers for the same key during a single fetch share one upstream request.
+
+    Returns (result, is_leader). `is_leader` is True only for the single caller
+    that actually ran coro_fn; waiters get False so they can skip redundant
+    post-processing (e.g. re-writing Redis / re-archiving the same response).
     """
     async with _lock:
         if key in _inflight:
@@ -29,12 +33,12 @@ async def coalesce(key: str, coro_fn: Callable[[], Awaitable[T]]) -> T:
             wait_existing = False
 
     if wait_existing:
-        return await asyncio.shield(fut)
+        return await asyncio.shield(fut), False
 
     try:
         result = await coro_fn()
         fut.set_result(result)
-        return result
+        return result, True
     except Exception as exc:
         fut.set_exception(exc)
         raise

@@ -2,9 +2,10 @@
 Redis hot-cache layer.
 
 Key layout:
-  esi:body:{cache_key}        → raw ESI response bytes (with TTL)
-  esi:stale:{cache_key}       → stale response bytes (TTL + stale window)
+  esi:body:{cache_key}        → ESI response bytes (with TTL); zstd/zlib-compressed above a size threshold
+  esi:stale:{cache_key}       → stale response bytes (TTL + stale window), same encoding as body
   esi:etag:{cache_key}        → ETag string (same TTL + 60s buffer)
+  esi:ttl:{cache_key}         → last body TTL, so a 304 without Cache-Control can preserve it
   esi:neg:body:{cache_key}    → cached 4xx body (short TTL — negative cache)
   esi:neg:status:{cache_key}  → cached 4xx status code (same TTL)
   esi:name:{datasource}:{entity_id} → JSON {"name": str, "category": str} (24h TTL)
@@ -16,10 +17,43 @@ from redis.asyncio import Redis
 
 from app.config import Settings
 
+# Marks a compressed cache value: _CACHE_MAGIC + 1 codec byte (z=zstd, l=zlib) + data.
+# ESI bodies are JSON (start with '[', '{', or whitespace), so this binary prefix
+# never collides with an uncompressed value; legacy unprefixed values read as raw.
+_CACHE_MAGIC = b"\x00zc\x00"
+
+
+def _compress_value(body: bytes) -> bytes:
+    try:
+        import zstandard as zstd
+
+        return _CACHE_MAGIC + b"z" + zstd.ZstdCompressor(level=6).compress(body)
+    except ImportError:
+        import zlib
+
+        return _CACHE_MAGIC + b"l" + zlib.compress(body, level=6)
+
+
+def _decode_value(value: bytes) -> bytes:
+    if not value.startswith(_CACHE_MAGIC):
+        return value
+    codec = value[len(_CACHE_MAGIC):len(_CACHE_MAGIC) + 1]
+    data = value[len(_CACHE_MAGIC) + 1:]
+    if codec == b"z":
+        import zstandard as zstd
+
+        return zstd.ZstdDecompressor().decompress(data)
+    if codec == b"l":
+        import zlib
+
+        return zlib.decompress(data)
+    return value
+
 
 class CacheClient:
-    def __init__(self, redis: Redis) -> None:
+    def __init__(self, redis: Redis, compress_min_bytes: int = 65536) -> None:
         self._r = redis
+        self._compress_min_bytes = compress_min_bytes
 
     async def get(self, key: str) -> Optional[tuple[bytes, Optional[str]]]:
         """
@@ -32,7 +66,7 @@ class CacheClient:
         body, etag = await pipe.execute()
         if body is None:
             return None
-        return body, etag.decode() if etag else None
+        return _decode_value(body), etag.decode() if etag else None
 
     async def set(
         self,
@@ -43,20 +77,34 @@ class CacheClient:
         stale_ttl: int = 86400,
     ) -> None:
         """Store body with TTL, plus a bounded stale copy for degraded-mode fallback."""
+        stored = _compress_value(body) if len(body) >= self._compress_min_bytes else body
         pipe = self._r.pipeline()
-        pipe.set(f"esi:body:{key}", body, ex=ttl)
+        pipe.set(f"esi:body:{key}", stored, ex=ttl)
         if stale_ttl > 0:
-            pipe.set(f"esi:stale:{key}", body, ex=ttl + stale_ttl)
+            pipe.set(f"esi:stale:{key}", stored, ex=ttl + stale_ttl)
         else:
             pipe.delete(f"esi:stale:{key}")
         if etag:
             pipe.set(f"esi:etag:{key}", etag, ex=ttl + 60)
+            # Remember the TTL so a later 304 without Cache-Control can preserve it.
+            pipe.set(f"esi:ttl:{key}", str(ttl), ex=ttl + 60)
         else:
             pipe.delete(f"esi:etag:{key}")
+            pipe.delete(f"esi:ttl:{key}")
         # A fresh success supersedes any negative-cache entry for this key.
         pipe.delete(f"esi:neg:body:{key}")
         pipe.delete(f"esi:neg:status:{key}")
         await pipe.execute()
+
+    async def get_ttl(self, key: str) -> Optional[int]:
+        """Return the last stored body TTL for `key`, or None (see 304 handling)."""
+        raw = await self._r.get(f"esi:ttl:{key}")
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
 
     async def set_negative(self, key: str, body: bytes, status: int, ttl: int) -> None:
         """
@@ -82,16 +130,10 @@ class CacheClient:
         except (TypeError, ValueError):
             return None
 
-    async def refresh_ttl(self, key: str, ttl: int) -> None:
-        """Extend TTL on body (and etag if present) without changing the value."""
-        pipe = self._r.pipeline()
-        pipe.expire(f"esi:body:{key}", ttl)
-        pipe.expire(f"esi:etag:{key}", ttl + 60)
-        await pipe.execute()
-
     async def get_stale(self, key: str) -> Optional[bytes]:
         """Return a recently expired cached body for degraded-mode fallback, if present."""
-        return await self._r.get(f"esi:stale:{key}")
+        raw = await self._r.get(f"esi:stale:{key}")
+        return _decode_value(raw) if raw is not None else None
 
     async def get_name(self, datasource: str, entity_id: int) -> Optional[dict]:
         """Return {"name": str, "category": str} for a known entity ID, or None."""
@@ -129,4 +171,4 @@ class CacheClient:
 
 async def create_cache_client(settings: Settings) -> CacheClient:
     redis = Redis.from_url(settings.redis_url, decode_responses=False)
-    return CacheClient(redis)
+    return CacheClient(redis, compress_min_bytes=settings.cache_compress_min_bytes)

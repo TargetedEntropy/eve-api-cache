@@ -74,7 +74,9 @@ _ENDPOINTS: list[EndpointSpec] = [
     EndpointSpec(re.compile(r"^/characters/\d+/?$"), frozenset({"GET"}), ArchiveType.REFERENCE),
     EndpointSpec(re.compile(r"^/characters/\d+/portrait/?$"), frozenset({"GET"}), ArchiveType.REFERENCE),
     EndpointSpec(re.compile(r"^/characters/\d+/corporationhistory/?$"), frozenset({"GET"}), ArchiveType.TIME_SERIES),
-    EndpointSpec(re.compile(r"^/characters/affiliation/?$"), frozenset({"POST"}), ArchiveType.REFERENCE),
+    # Affiliation is character→corp/alliance at a point in time — append each
+    # batch (TIME_SERIES) so the history is preserved, not overwritten per body hash.
+    EndpointSpec(re.compile(r"^/characters/affiliation/?$"), frozenset({"POST"}), ArchiveType.TIME_SERIES),
     # Corporations
     EndpointSpec(re.compile(r"^/corporations/\d+/?$"), frozenset({"GET"}), ArchiveType.REFERENCE),
     EndpointSpec(re.compile(r"^/corporations/\d+/icons/?$"), frozenset({"GET"}), ArchiveType.REFERENCE),

@@ -167,13 +167,14 @@ async def write_snapshot(
         stmt = pg_insert(EventSnapshot).values(
             datasource=datasource,
             path=path,
+            query_hash=query_hash,
             content_hash=content_hash,
             payload=payload_json,
             fetched_at=now,
             etag=etag,
             http_status=http_status,
         ).on_conflict_do_nothing(
-            index_elements=["datasource", "path"]
+            index_elements=["datasource", "path", "query_hash"]
         )
         await session.execute(stmt)
 
@@ -187,12 +188,14 @@ async def write_names(
     payload: bytes,
 ) -> None:
     """
-    Extract per-ID name mappings from /universe/names/, /universe/ids/,
-    and /characters/affiliation/ responses and persist them to both
-    the Redis name cache and the IdNameCache table.
+    Extract per-ID name mappings from /universe/names/ and /universe/ids/
+    responses and persist them to both the Redis name cache and IdNameCache.
 
     /universe/names/ response: [{id, name, category}, ...]
-    /characters/affiliation/ response: [{character_id, corporation_id, alliance_id?, faction_id?}, ...]
+    /universe/ids/ response:   {"characters": [{id, name}, ...], "systems": [...], ...}
+
+    Note: /characters/affiliation/ carries no id→name pairs, so it yields nothing
+    here; its history is captured by the TIME_SERIES archive of the raw response.
     """
     now = datetime.now(timezone.utc)
     try:
@@ -284,10 +287,12 @@ async def get_latest_payload(
     if result is not None:
         return json.dumps(result).encode()
 
-    # Event: insert-once row
+    # Event: insert-once row (keyed by query_hash too, so params-bearing EVENT
+    # endpoints don't collapse distinct queries to one row — 2.8)
     stmt = select(EventSnapshot.payload).where(
         EventSnapshot.datasource == datasource,
         EventSnapshot.path == path,
+        EventSnapshot.query_hash == query_hash,
     )
     row = await session.execute(stmt)
     result = row.scalar_one_or_none()

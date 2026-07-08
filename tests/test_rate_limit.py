@@ -43,3 +43,19 @@ async def test_window_evicts_expired_hits(monkeypatch):
     assert (await rl.allow("c"))[0] is False   # t=1000, over limit
     fake.now = 1061.0                           # 61s later → prior hit aged out
     assert (await rl.allow("c"))[0] is True
+
+
+async def test_idle_keys_are_pruned(monkeypatch):
+    fake = _FakeTime(1000.0)
+    monkeypatch.setattr(rate_limit, "time", fake)
+    rl = InMemoryRateLimiter(5, window_seconds=60)
+    rl._prune_interval = 2
+
+    await rl.allow("a")
+    await rl.allow("b")            # ops=2 → prune runs; a,b still fresh
+    assert set(rl._hits) == {"a", "b"}
+
+    fake.now = 1100.0              # a and b now idle (> window)
+    await rl.allow("c")
+    await rl.allow("c")           # ops=2 → prune drops idle a,b; keeps c
+    assert set(rl._hits) == {"c"}

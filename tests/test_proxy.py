@@ -6,6 +6,8 @@ Uses:
   - AsyncMock for ESIClient (no real HTTP calls)
   - patch() for app.archive functions (no real PostgreSQL)
 """
+import asyncio
+import json
 import pytest
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch, MagicMock
@@ -686,6 +688,100 @@ async def test_304_refetch_goes_through_coalesce(
     assert result.status == 200
     assert mock_esi.fetch.call_count == 2  # conditional 304 + unconditional refetch
     assert any(k.endswith(":refetch") for k in seen_keys)
+
+
+async def test_304_preserves_prior_ttl_without_cache_control(
+    cache_client: CacheClient, mock_db, test_settings: Settings
+):
+    """304 with no Cache-Control reuses the stored TTL, not a flat 300 (fix 2.4)."""
+    key = build_cache_key(
+        "tranquility", "GET", "/v1/markets/10000002/orders/", {"order_type": "all"}, None
+    )
+    await cache_client.set(key, b'[{"order_id":1}]', ttl=600, etag='"e1"')
+    await cache_client._r.delete(f"esi:body:{key}")  # evict body; stale+etag+ttl remain
+
+    mock_esi = AsyncMock()
+    mock_esi.fetch.return_value = ESIResponse(
+        status=304, body=b"", etag='"e1"', max_age=None, expires_at=None, not_modified=True
+    )
+
+    result = await proxy_request(
+        "/v1/markets/10000002/orders/", "GET", {"order_type": "all"}, None,
+        cache_client, mock_esi, mock_db, test_settings,
+    )
+    assert result.status == 200
+    body_ttl = await cache_client._r.ttl(f"esi:body:{key}")
+    assert body_ttl > 400  # ~600 preserved, not reset to 300
+
+
+async def test_upstream_5xx_no_fallback_returns_json_envelope(
+    cache_client: CacheClient, mock_db, test_settings: Settings
+):
+    """A 5xx with no stale/archive is enveloped, not relayed raw (fix 4.4)."""
+    mock_esi = AsyncMock()
+    mock_esi.fetch.return_value = make_esi_500(b"<html>gateway blew up</html>")
+
+    with patch("app.archive.get_latest_payload", new=AsyncMock(return_value=None)):
+        result = await proxy_request(
+            "/v1/markets/10000002/orders/", "GET", {"order_type": "all"}, None,
+            cache_client, mock_esi, mock_db, test_settings,
+        )
+    assert result.status == 500
+    assert result.cache_status == "ERROR"
+    assert json.loads(result.body) == {"error": "upstream_error", "status": 500}
+
+
+async def test_4xx_content_type_is_propagated(
+    cache_client: CacheClient, mock_db, test_settings: Settings
+):
+    """A non-JSON upstream 4xx keeps its real Content-Type instead of forced JSON (fix 5.6)."""
+    mock_esi = AsyncMock()
+    resp = make_esi_404(b"<html>nope</html>")
+    resp.content_type = "text/html"
+    mock_esi.fetch.return_value = resp
+
+    result = await proxy_request(
+        "/v1/universe/types/999999/", "GET", {}, None,
+        cache_client, mock_esi, mock_db, test_settings,
+    )
+    assert result.status == 404
+    assert result.content_type == "text/html"
+
+
+async def test_coalesced_waiter_does_not_rewrite_or_rearchive(
+    cache_client: CacheClient, mock_db, test_settings: Settings
+):
+    """Only the coalesce leader writes cache/archive; the waiter shares the body (fix 2.7)."""
+    body = b'[{"order_id":1}]'
+    started = asyncio.Event()
+    release = asyncio.Event()
+    fetch_calls = {"n": 0}
+
+    async def slow_fetch(*args, **kwargs):
+        fetch_calls["n"] += 1
+        started.set()
+        await release.wait()
+        return make_esi_200(body)
+
+    mock_esi = AsyncMock()
+    mock_esi.fetch.side_effect = slow_fetch
+    write = AsyncMock()
+
+    args = ("/v1/markets/10000002/orders/", "GET", {"order_type": "all"}, None,
+            cache_client, mock_esi, mock_db, test_settings)
+    with patch("app.archive.write_snapshot", new=write):
+        leader = asyncio.create_task(proxy_request(*args))
+        await started.wait()                 # leader is mid-fetch (inflight registered)
+        follower = asyncio.create_task(proxy_request(*args))
+        await asyncio.sleep(0.05)            # let the follower reach + park at coalesce
+        release.set()
+        r1 = await leader
+        r2 = await follower
+
+    assert r1.status == r2.status == 200
+    assert r1.body == r2.body == body
+    assert fetch_calls["n"] == 1             # coalesced upstream fetch
+    write.assert_called_once()               # only the leader archived
 
 
 async def test_large_payload_skips_stale_redis_copy(

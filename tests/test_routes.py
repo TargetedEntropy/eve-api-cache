@@ -13,7 +13,25 @@ from fastapi import FastAPI
 from app.deps import get_cache, get_db, get_esi, get_settings
 from app.proxy import ProxyResult
 from app.rate_limit import InMemoryRateLimiter
-from app.routes import _read_body_capped, router
+from app.routes import _client_key, _read_body_capped, router
+
+
+class _FakeReq:
+    def __init__(self, host, xff=None):
+        self.client = type("C", (), {"host": host})()
+        self.headers = {"x-forwarded-for": xff} if xff else {}
+
+
+def test_client_key_ignores_xff_from_untrusted_peer():
+    assert _client_key(_FakeReq("1.2.3.4", "9.9.9.9"), ["10.0.0.1"]) == "1.2.3.4"
+
+
+def test_client_key_uses_first_xff_hop_from_trusted_peer():
+    assert _client_key(_FakeReq("10.0.0.1", "9.9.9.9, 10.0.0.1"), ["10.0.0.1"]) == "9.9.9.9"
+
+
+def test_client_key_falls_back_to_peer_without_xff():
+    assert _client_key(_FakeReq("10.0.0.1"), ["10.0.0.1"]) == "10.0.0.1"
 
 
 # ---------------------------------------------------------------------------

@@ -23,9 +23,12 @@ async def test_concurrent_waiters_share_one_execution():
     await asyncio.sleep(0)               # let the follower attach to the future
     release.set()
 
-    assert await leader == "shared-result"
-    assert await follower == "shared-result"
+    leader_result, leader_is_leader = await leader
+    follower_result, follower_is_leader = await follower
+    assert leader_result == follower_result == "shared-result"
     assert calls["n"] == 1               # coro_fn ran exactly once
+    assert leader_is_leader is True      # only the leader "owns" the writes (2.7)
+    assert follower_is_leader is False
 
 
 async def test_leader_failure_propagates_to_waiters():
@@ -61,7 +64,8 @@ async def test_key_is_released_after_completion():
         calls["n"] += 1
         return 2
 
-    assert await coalesce("k3", fn2) == 2
+    result, is_leader = await coalesce("k3", fn2)
+    assert result == 2 and is_leader is True
     assert calls["n"] == 1
 
 
@@ -72,7 +76,8 @@ async def test_distinct_keys_run_independently():
         calls["n"] += 1
         return calls["n"]
 
-    r1 = await coalesce("a", fn)
-    r2 = await coalesce("b", fn)
+    r1, leader1 = await coalesce("a", fn)
+    r2, leader2 = await coalesce("b", fn)
     assert calls["n"] == 2
     assert {r1, r2} == {1, 2}
+    assert leader1 is True and leader2 is True   # distinct keys → each is its own leader

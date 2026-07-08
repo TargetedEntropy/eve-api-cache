@@ -1,7 +1,7 @@
 """FastAPI routes — health check, collector status, catch-all ESI proxy."""
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.cache import CacheClient
@@ -30,6 +30,27 @@ def _error_response(body: bytes, status: int) -> Response:
     return Response(content=body, status_code=status, media_type=_JSON, headers={"X-Cache": "ERROR"})
 
 
+def _client_key(request: Request, trusted_proxies: list[str]) -> str:
+    """Rate-limit key: the direct peer, or the first X-Forwarded-For hop when the
+    peer is a trusted reverse proxy (so clients behind it are attributed) (4.3)."""
+    peer = request.client.host if request.client else "unknown"
+    if peer in trusted_proxies:
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded:
+            return forwarded.split(",")[0].strip()
+    return peer
+
+
+async def _require_ops_token(
+    request: Request, cfg: Settings = Depends(get_settings)
+) -> None:
+    """Gate ops endpoints behind X-Ops-Token when ops_api_token is configured (4.5)."""
+    if cfg.ops_api_token is None:
+        return
+    if request.headers.get("x-ops-token") != cfg.ops_api_token:
+        raise HTTPException(status_code=401, detail="ops token required")
+
+
 async def _read_body_capped(request: Request, limit: int) -> Optional[bytes]:
     """
     Read the request body incrementally, aborting as soon as it exceeds `limit`
@@ -52,14 +73,14 @@ async def health() -> dict:
 
 
 @router.get("/collector/status")
-async def collector_status(request: Request) -> dict:
+async def collector_status(request: Request, _: None = Depends(_require_ops_token)) -> dict:
     """List all scheduled collector jobs and their next run times."""
     jobs = scheduler_status(request.app.state.scheduler)
     return {"jobs": jobs, "count": len(jobs)}
 
 
 @router.get("/metrics")
-async def metrics_endpoint() -> Response:
+async def metrics_endpoint(_: None = Depends(_require_ops_token)) -> Response:
     """Prometheus text exposition of in-process metrics."""
     return Response(
         content=metrics.render(),
@@ -77,7 +98,7 @@ async def proxy(
     esi: ESIClient = Depends(get_esi),
     cfg: Settings = Depends(get_settings),
 ) -> Response:
-    client_host = request.client.host if request.client else "unknown"
+    client_host = _client_key(request, cfg.trusted_proxies)
     allowed, remaining = await request.app.state.rate_limiter.allow(client_host)
     if not allowed:
         metrics.inc_counter("client_rate_limited_total", help="Requests rejected by the per-client rate limiter")

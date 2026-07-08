@@ -125,6 +125,7 @@ class EventSnapshot(Base):
 
     datasource: Mapped[str] = mapped_column(String(20), primary_key=True)
     path: Mapped[str] = mapped_column(Text, primary_key=True)
+    query_hash: Mapped[str] = mapped_column(String(16), primary_key=True, default="")
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
     fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -180,5 +181,11 @@ class MarketOrderSnapshotEntry(Base):
     )
 
 
-async_engine = create_async_engine(settings.database_url, echo=False, pool_pre_ping=True)
+async_engine = create_async_engine(
+    settings.database_url,
+    echo=False,
+    pool_pre_ping=True,
+    pool_size=settings.db_pool_size,
+    max_overflow=settings.db_max_overflow,
+)
 AsyncSessionLocal = async_sessionmaker(async_engine, expire_on_commit=False, class_=AsyncSession)
